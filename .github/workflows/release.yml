@@ -39,8 +39,8 @@ jobs:
       - name: Install Linux musl linker
         if: runner.os == 'Linux'
         run: |
-          sudo -n apt-get update -o Acquire::Retries=2 || true
-          sudo -n apt-get install -y musl-tools || echo "::warning::musl-tools unavailable (apt mirror unreachable); the musl targets link against rustc's self-contained musl"
+          timeout 90 sudo -n apt-get update -o Acquire::Retries=2 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 || true
+          timeout 120 sudo -n apt-get install -y -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 musl-tools || echo "::warning::musl-tools unavailable (apt mirror unreachable); the musl targets link against rustc's self-contained musl"
       - name: Test
         if: matrix.target == 'x86_64-unknown-linux-musl'
         env:
