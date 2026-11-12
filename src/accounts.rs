@@ -1260,17 +1260,73 @@ pub fn run() -> anyhow::Result<()> {
     }
 }
 
+/// Host theme colors from `GRAY_MODAL_THEME` (`role=#rrggbb,...`), with the
+/// default gray theme for anything missing.
+struct Theme {
+    raised: ratatui::style::Color,
+    faint: ratatui::style::Color,
+    dim: ratatui::style::Color,
+    muted: ratatui::style::Color,
+    body: ratatui::style::Color,
+    bright: ratatui::style::Color,
+    accent: ratatui::style::Color,
+    accent_soft: ratatui::style::Color,
+    on_selection: ratatui::style::Color,
+}
+
+fn theme() -> Theme {
+    use ratatui::style::Color::Rgb;
+    let mut t = Theme {
+        raised: Rgb(28, 28, 28),
+        faint: Rgb(70, 70, 70),
+        dim: Rgb(110, 110, 110),
+        muted: Rgb(140, 140, 140),
+        body: Rgb(225, 225, 225),
+        bright: Rgb(240, 240, 240),
+        accent: Rgb(246, 173, 126),
+        accent_soft: Rgb(254, 215, 170),
+        on_selection: Rgb(22, 22, 22),
+    };
+    for pair in std::env::var("GRAY_MODAL_THEME")
+        .unwrap_or_default()
+        .split(',')
+    {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        let v = v.trim_start_matches('#');
+        let p = |i: usize| v.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok());
+        let (Some(r), Some(g), Some(b)) = (p(0), p(2), p(4)) else {
+            continue;
+        };
+        let c = Rgb(r, g, b);
+        match k {
+            "raised_bg" => t.raised = c,
+            "text_faint" => t.faint = c,
+            "text_dim" => t.dim = c,
+            "text_muted" => t.muted = c,
+            "text_body" => t.body = c,
+            "text_bright" => t.bright = c,
+            "accent" => t.accent = c,
+            "accent_soft" => t.accent_soft = c,
+            "on_selection" => t.on_selection = c,
+            _ => {}
+        }
+    }
+    t
+}
+
 fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, poll, read};
     use crossterm::{cursor, execute, terminal};
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
     use ratatui::layout::Rect;
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
-    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+    use ratatui::widgets::{Block, Clear, Paragraph};
 
-    const ACCENT: Color = Color::Rgb(246, 173, 126);
+    let th = theme();
 
     terminal::enable_raw_mode()?;
     let mut out = std::io::stdout();
@@ -1292,80 +1348,128 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
             if area.width < 30 || area.height < 8 {
                 return;
             }
-            let modal_w = (area.width.saturating_sub(4))
-                .clamp(56, 110)
-                .min(area.width);
+            let fg = |c| Style::default().fg(c);
             let detail = match &panel.mode {
                 Mode::Detail { plugin, label } => {
                     Some(panel.detail_lines(plugin, label.as_deref()))
                 }
                 _ => None,
             };
-            let body_h = match &detail {
-                Some(lines) => lines.len() as u16 + 5,
-                None => panel.rows.len().max(1) as u16 + 7,
-            };
-            let modal_h = body_h.min(area.height.saturating_sub(2)).max(7);
-            let x = area.x + (area.width.saturating_sub(modal_w)) / 2;
-            let y = area.y + (area.height.saturating_sub(modal_h)) / 2;
-            let rect = Rect::new(x, y, modal_w, modal_h);
-            frame.render_widget(Clear, rect);
-            let block = Block::default().borders(Borders::ALL).title(" Connect ");
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
-
-            let mut lines: Vec<Line> = Vec::new();
-            match detail {
-                Some(body) => {
-                    for text in body {
-                        lines.push(Line::from(text));
-                    }
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
-                        "esc back · q close",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
+            let mut body: Vec<Line> = Vec::new();
+            let mut sel_line = None;
+            match &detail {
+                Some(text) => body.extend(text.iter().map(|t| Line::from(Span::styled(t.clone(), fg(th.body))))),
                 None => {
                     if panel.rows.is_empty() {
-                        lines.push(Line::from(Span::styled(
-                            "no provider plugins installed — /connect to add one",
-                            Style::default().fg(Color::DarkGray),
+                        body.push(Line::from(Span::styled(
+                            "no provider plugins installed, /connect to add one",
+                            fg(th.faint),
                         )));
                     }
                     for (i, row) in panel.rows.iter().enumerate() {
                         let (text, header) = panel.row_text(row);
-                        let selected = i == panel.sel;
-                        let style = if selected {
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                        let hint = matches!(row, Row::AddHint { .. })
+                            || matches!(row, Row::Ambient { provider } if panel.not_connected(*provider));
+                        let style = if i == panel.sel {
+                            sel_line = Some(body.len());
+                            fg(th.on_selection).add_modifier(Modifier::BOLD)
                         } else if header {
-                            Style::default().add_modifier(Modifier::BOLD)
+                            fg(th.bright).add_modifier(Modifier::BOLD)
+                        } else if hint {
+                            fg(th.faint)
                         } else {
-                            Style::default()
+                            fg(th.body)
                         };
-                        let marker = if selected { "› " } else { "  " };
-                        lines.push(Line::from(Span::styled(format!("{marker}{text}"), style)));
+                        body.push(Line::from(Span::styled(text, style)));
                     }
-                    lines.push(Line::from(""));
-                    if let Mode::Adding { buf, .. } = &panel.mode {
-                        lines.push(Line::from(Span::styled(
-                            format!("new account — label [home]: {buf}▌"),
-                            Style::default().fg(ACCENT),
-                        )));
-                    }
-                    if let Some(msg) = &panel.status {
-                        lines.push(Line::from(Span::styled(
-                            msg.clone(),
-                            Style::default().fg(Color::Yellow),
-                        )));
-                    }
-                    lines.push(Line::from(Span::styled(
-                        "enter detail · a add · p pin · c unpin · d remove · s strategy · r refresh · q close",
-                        Style::default().fg(Color::DarkGray),
-                    )));
                 }
             }
-            frame.render_widget(Paragraph::new(lines), inner);
+            let mut notes: Vec<Line> = Vec::new();
+            if let Mode::Adding { buf, .. } = &panel.mode {
+                notes.push(Line::from(vec![
+                    Span::styled("new account label ", fg(th.dim)),
+                    Span::styled(if buf.is_empty() { "home".to_string() } else { buf.clone() }, fg(th.bright)),
+                    Span::styled("▌", fg(th.accent)),
+                ]));
+            }
+            if let Some(msg) = &panel.status {
+                notes.push(Line::from(Span::styled(msg.clone(), fg(th.accent_soft))));
+            }
+            let keys: &[(&str, &str)] = match &panel.mode {
+                Mode::Detail { .. } => &[("esc", "back"), ("q", "close")],
+                Mode::Adding { .. } => &[("enter", "add"), ("esc", "cancel")],
+                Mode::ConfirmRemove { .. } => &[("d", "confirm remove"), ("esc", "cancel")],
+                Mode::Running { .. } => &[],
+                Mode::List => &[
+                    ("↑↓", "move"),
+                    ("enter", "detail"),
+                    ("a", "add"),
+                    ("p", "pin"),
+                    ("c", "unpin"),
+                    ("d", "remove"),
+                    ("s", "strategy"),
+                    ("r", "refresh"),
+                    ("esc", "close"),
+                ],
+            };
+
+            let keys_w: usize = keys.iter().map(|(k, l)| k.chars().count() + l.chars().count() + 4).sum();
+            let widest = body.iter().map(Line::width).max().unwrap_or(0).max(keys_w);
+            let modal_w = (widest as u16 + 4).clamp(64, 116).min(area.width.saturating_sub(2));
+            // header, gap, body, gap, notes, keys
+            let want = body.len() as u16 + notes.len() as u16 + 6;
+            let modal_h = want.min(area.height.saturating_sub(2));
+            let rect = Rect::new(
+                area.x + (area.width.saturating_sub(modal_w)) / 2,
+                area.y + (area.height.saturating_sub(modal_h)) / 3,
+                modal_w,
+                modal_h,
+            );
+            frame.render_widget(Clear, rect);
+            frame.render_widget(Block::default().style(Style::default().bg(th.raised)), rect);
+            // Rows span the full width so the selection bar does; text sits two in.
+            let inner = Rect::new(rect.x, rect.y + 1, rect.width, rect.height.saturating_sub(2));
+            let row = |y: u16| Rect::new(inner.x, y, inner.width, 1);
+            let bottom = inner.y + inner.height;
+            let title = match &panel.mode {
+                Mode::Detail { plugin, label } => match label {
+                    Some(l) => format!("{plugin} · {l}"),
+                    None => plugin.clone(),
+                },
+                _ => "Accounts".to_string(),
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(title, fg(th.bright).add_modifier(Modifier::BOLD)),
+                ])),
+                row(inner.y),
+            );
+
+            let list_y = inner.y + 2;
+            let list_h = bottom.saturating_sub(list_y + 2 + notes.len() as u16) as usize;
+            let start = sel_line.map_or(0, |s| s.saturating_sub(list_h.saturating_sub(1)));
+            for (vi, mut line) in body.into_iter().enumerate().skip(start).take(list_h) {
+                line.spans.insert(0, Span::raw("  "));
+                let bar = if sel_line == Some(vi) {
+                    Style::default().bg(th.accent)
+                } else {
+                    Style::default()
+                };
+                frame.render_widget(Paragraph::new(line).style(bar), row(list_y + (vi - start) as u16));
+            }
+            let keys_y = bottom.saturating_sub(1);
+            for (n, mut line) in notes.into_iter().enumerate() {
+                line.spans.insert(0, Span::raw("  "));
+                let y = keys_y.saturating_sub(1 + n as u16);
+                frame.render_widget(Paragraph::new(line), row(y));
+            }
+            let mut hint = vec![Span::raw("  ")];
+            for (k, label) in keys {
+                hint.push(Span::styled(*k, fg(th.muted)));
+                hint.push(Span::styled(format!(" {label}   "), fg(th.dim)));
+            }
+            frame.render_widget(Paragraph::new(Line::from(hint)), row(keys_y));
         })?;
         panel.pump_usage();
 
