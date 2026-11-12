@@ -341,6 +341,17 @@ fn run_json(argv: &[String], verb: &[&str], timeout: Duration) -> Result<Value, 
     serde_json::from_slice(&out.stdout).map_err(|e| format!("bad account json: {e}"))
 }
 
+/// A list-row form of a probe error; the detail pane keeps the full text.
+fn short_err(e: &str) -> String {
+    if e.starts_with("bad account json") {
+        return "unreadable account list".to_string();
+    }
+    match e.char_indices().nth(48) {
+        Some((i, _)) => format!("{}\u{2026}", &e[..i]),
+        None => e.to_string(),
+    }
+}
+
 /// A mutation verb through the plugin CLI; `Ok(stdout)` on success.
 fn account_cmd(argv: &[String], args: &[&str]) -> Result<String, String> {
     let (prog, base) = argv.split_first().ok_or("empty argv")?;
@@ -795,7 +806,7 @@ impl Panel {
         match self.usage.get(&key) {
             Some(Fetch::Pending) | None => out.push("loading usage…".to_string()),
             Some(Fetch::Unsupported) => out.push("no usage from this plugin".to_string()),
-            Some(Fetch::Failed(e)) => out.push(format!("error: {e}")),
+            Some(Fetch::Failed(e)) => out.push(format!("\u{2717} {e}")),
             Some(Fetch::Loaded(card)) => {
                 if let Some(plan) = card["plan"].as_str() {
                     out.push(format!("plan {plan}"));
@@ -855,7 +866,7 @@ impl Panel {
                     line.push_str(&format!("   strategy {strategy}"));
                 }
                 if let Some(e) = &p.probe_err {
-                    line.push_str(&format!("   — {e}"));
+                    line.push_str(&format!("   \u{2717} {}", short_err(e)));
                 }
                 (line, true)
             }
