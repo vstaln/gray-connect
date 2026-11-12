@@ -512,7 +512,7 @@ fn window_cell(w: &Value, now: i64) -> Option<String> {
     let reset = w["resets_at"]
         .as_str()
         .and_then(|at| countdown(at, now))
-        .map(|c| format!("⏳ {c}"))
+        .map(|c| format!("resets in {c}"))
         .unwrap_or_default();
     Some(format!("{label:<15} {}  {pct:>3.0}%  {reset}", bar(pct)))
 }
