@@ -585,10 +585,10 @@ impl Panel {
         let served: std::collections::BTreeSet<String> = providers
             .iter()
             .filter(|p| p.doc.is_some())
-            .map(|p| p.plugin.clone())
+            .flat_map(|p| [p.plugin.clone(), p.provider.clone()])
             .collect();
         for (auth_ref, lock, provider_id) in vault_refs(&auth) {
-            if served.contains(&lock) {
+            if served.contains(&lock) || served.contains(&provider_id) {
                 continue;
             }
             providers.push(Provider {
