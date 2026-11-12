@@ -73,9 +73,17 @@ fn command_run(params: &Value) -> Value {
             "terminal": ["accounts"],
             "text": accounts::handoff_text(),
         }),
-        "/usage" => json!({ "text": accounts::text() }),
+        // A pick only closes the list; account changes live in /connect.
+        "/usage" if picked(params) => json!({}),
+        "/usage" => accounts::usage_picker(),
         _ => json!({ "text": "" }),
     }
+}
+
+fn picked(params: &Value) -> bool {
+    params["argv"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|v| v == "--pick"))
 }
 
 #[cfg(test)]

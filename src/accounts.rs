@@ -1099,6 +1099,89 @@ pub fn text() -> String {
     render_text(true)
 }
 
+/// `/usage` as a host picker: one row per login that can answer for quota,
+/// usage bars on the right. Providers without a login or without account
+/// support stay out of the list; `/connect` is where those are managed.
+pub fn usage_picker() -> Value {
+    let mut panel = Panel::load();
+    panel.start_usage();
+    panel.await_usage(USAGE_TIMEOUT + Duration::from_secs(2));
+    panel.rebuild_rows();
+    let auth = auth_path().unwrap_or_default();
+    let mut items = Vec::new();
+    let mut current = 0usize;
+    for row in &panel.rows {
+        let (provider, label, pinned, cooling) = match row {
+            Row::Header { provider } => {
+                current = *provider;
+                continue;
+            }
+            Row::Account { provider, label } => {
+                let a = panel.providers[*provider].doc.as_ref().and_then(|d| {
+                    d["accounts"]
+                        .as_array()?
+                        .iter()
+                        .find(|x| x["label"].as_str() == Some(label))
+                        .cloned()
+                });
+                let a = a.unwrap_or_default();
+                let left = a["cooldown_until"].as_u64().unwrap_or(0);
+                (
+                    *provider,
+                    Some(label.clone()),
+                    a["pinned"].as_bool() == Some(true),
+                    (a["cooling"].as_bool() == Some(true)).then_some(left),
+                )
+            }
+            Row::Vault { auth_ref, label } => {
+                let r = vault_rows(&auth, auth_ref)
+                    .into_iter()
+                    .find(|r| r.label == *label);
+                let pinned = r.as_ref().is_some_and(|r| r.pinned);
+                let cooling = r.filter(|r| r.cooling).map(|r| r.cooldown_until);
+                (current, Some(label.clone()), pinned, cooling)
+            }
+            Row::Ambient { provider } if !panel.not_connected(*provider) => {
+                (*provider, None, false, None)
+            }
+            _ => continue,
+        };
+        let plugin = &panel.providers[provider].plugin;
+        let mut cells = panel.usage_cell(plugin, label.as_deref());
+        if cells.is_empty() && pinned {
+            cells = panel.usage_cell(plugin, None);
+        }
+        let mut desc = match cells.trim() {
+            "" => "no quota reported".to_string(),
+            c => c.to_string(),
+        };
+        if let Some(until) = cooling {
+            let left = until.saturating_sub(now_secs());
+            desc.push_str(&format!("   cooling {}m{:02}s", left / 60, left % 60));
+        }
+        let mark = if pinned { "● " } else { "  " };
+        let name = match &label {
+            Some(l) => format!("{mark}{plugin} · {l}"),
+            None => format!("{mark}{plugin}"),
+        };
+        items.push(json!({
+            "id": format!("{plugin}/{}", label.as_deref().unwrap_or("")),
+            "label": name,
+            "description": desc,
+        }));
+    }
+    if items.is_empty() {
+        return json!({ "text": "no logins report usage yet. /connect adds an account" });
+    }
+    json!({
+        "picker": {
+            "title": "Usage",
+            "items": items,
+            "footer": "● pinned account · /connect manages accounts",
+        },
+    })
+}
+
 pub fn handoff_text() -> String {
     render_text(false)
 }
