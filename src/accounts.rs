@@ -502,8 +502,8 @@ fn countdown(resets_at: &str, now: i64) -> Option<String> {
 }
 
 fn bar(pct: f64) -> String {
-    let filled = (pct.clamp(0.0, 100.0) * 5.0 / 100.0).ceil() as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(5 - filled))
+    let filled = (pct.clamp(0.0, 100.0) * 12.0 / 100.0).ceil() as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(12 - filled))
 }
 
 fn window_cell(w: &Value, now: i64) -> Option<String> {
@@ -514,7 +514,7 @@ fn window_cell(w: &Value, now: i64) -> Option<String> {
         .and_then(|at| countdown(at, now))
         .map(|c| format!("↻{c}"))
         .unwrap_or_default();
-    Some(format!("{label:<7} {} {pct:>3.0}% {reset:<5}", bar(pct)))
+    Some(format!("{label:<15} {}  {pct:>3.0}%  {reset}", bar(pct)))
 }
 
 fn window_detail(w: &Value, now: i64) -> Option<String> {
@@ -744,27 +744,22 @@ impl Panel {
         self.start_usage();
     }
 
-    fn usage_cell(&self, plugin: &str, label: Option<&str>) -> String {
+    /// The login's email from its usage card, and one line per quota window.
+    fn usage_lines(&self, plugin: &str, label: Option<&str>) -> (Option<String>, Vec<String>) {
         let key = (plugin.to_string(), label.map(str::to_string));
-        let cells = match self.usage.get(&key) {
-            Some(Fetch::Pending) => return "  …".to_string(),
+        match self.usage.get(&key) {
+            Some(Fetch::Pending) => (None, vec!["\u{2026}".to_string()]),
             Some(Fetch::Loaded(card)) => {
                 let now = now_secs() as i64;
-                card["windows"]
+                let lines = card["windows"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .take(2)
                     .filter_map(|w| window_cell(w, now))
-                    .collect::<Vec<_>>()
-                    .join("  ")
+                    .collect();
+                (card["email"].as_str().map(str::to_string), lines)
             }
-            _ => String::new(),
-        };
-        if cells.is_empty() {
-            cells
-        } else {
-            format!("  {cells}")
+            _ => (None, Vec::new()),
         }
     }
 
@@ -902,8 +897,8 @@ impl Panel {
                     .as_str()
                     .map(|o| format!(" · {o}"))
                     .unwrap_or_default();
-                let usage = self.usage_cell(&p.plugin, Some(label.as_str()));
-                let mut line = format!(" {pin} {label:<14} {who}{org}{usage}");
+                let (_, usage) = self.usage_lines(&p.plugin, Some(label.as_str()));
+                let mut line = format!(" {pin} {label:<14} {who}{org}");
                 if a["cooling"].as_bool() == Some(true) {
                     let left = a["cooldown_until"]
                         .as_u64()
@@ -914,6 +909,9 @@ impl Panel {
                 if let Some(e) = a["last_error"].as_str() {
                     line.push_str(&format!("   ({e})"));
                 }
+                for u in usage {
+                    line.push_str(&format!("\n     {u}"));
+                }
                 (line, false)
             }
             Row::Ambient { provider } => {
@@ -921,10 +919,12 @@ impl Panel {
                     ("   not connected \u{b7} a to log in".to_string(), false)
                 } else {
                     let plugin = &self.providers[*provider].plugin;
-                    (
-                        format!("   {:<14}{}", "signed in", self.usage_cell(plugin, None)),
-                        false,
-                    )
+                    let (email, usage) = self.usage_lines(plugin, None);
+                    let mut line = format!("   {}", email.as_deref().unwrap_or("signed in"));
+                    for u in usage {
+                        line.push_str(&format!("\n     {u}"));
+                    }
+                    (line, false)
                 }
             }
             Row::AddHint { .. } => ("   + add account".to_string(), false),
@@ -1159,30 +1159,33 @@ pub fn usage_picker() -> Value {
             _ => continue,
         };
         let plugin = &panel.providers[provider].plugin;
-        let mut cells = panel.usage_cell(plugin, label.as_deref());
-        if cells.is_empty() && pinned {
-            cells = panel.usage_cell(plugin, None);
+        let (mut email, mut lines) = panel.usage_lines(plugin, label.as_deref());
+        if lines.is_empty() && pinned {
+            (email, lines) = panel.usage_lines(plugin, None);
         }
-        if cells.trim().is_empty() || cells.trim() == "\u{2026}" {
+        lines.retain(|l| l != "\u{2026}");
+        if lines.is_empty() {
             continue;
-        }
-        let mut desc = cells.trim().to_string();
-        if let Some(until) = cooling {
-            let left = until.saturating_sub(now_secs());
-            desc.push_str(&format!("   cooling {}m{:02}s", left / 60, left % 60));
         }
         any_pinned |= pinned;
         let mark = if pinned { "\u{25cf} " } else { "" };
         let product = display_name(&panel.providers[provider]);
-        let name = match &label {
+        let mut head = match &label {
             Some(l) => format!("{mark}{product} \u{b7} {l}"),
             None => format!("{mark}{product}"),
         };
-        items.push(json!({
-            "id": format!("{plugin}/{}", label.as_deref().unwrap_or("")),
-            "label": name,
-            "description": desc,
-        }));
+        if let Some(e) = email {
+            head.push_str(&format!("  {e}"));
+        }
+        if let Some(until) = cooling {
+            let left = until.saturating_sub(now_secs());
+            head.push_str(&format!("   cooling {}m{:02}s", left / 60, left % 60));
+        }
+        let id = format!("{plugin}/{}", label.as_deref().unwrap_or(""));
+        items.push(json!({ "id": id, "label": head }));
+        for (i, l) in lines.into_iter().enumerate() {
+            items.push(json!({ "id": format!("{id}#{i}"), "label": format!("  {l}") }));
+        }
     }
     if items.is_empty() {
         return json!({ "text": "no logins report usage yet. /connect adds an account" });
@@ -1402,7 +1405,9 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                         } else {
                             fg(th.body)
                         };
-                        body.push(Line::from(Span::styled(text, style)));
+                        for part in text.split('\n') {
+                            body.push(Line::from(Span::styled(part.to_string(), style)));
+                        }
                     }
                 }
             }
