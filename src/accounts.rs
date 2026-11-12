@@ -247,7 +247,6 @@ struct Provider {
     provider: String,
     argv: Option<Vec<String>>,
     doc: Option<Value>,
-    probe_err: Option<String>,
 }
 
 fn lock_plugins(home: &Path) -> Vec<(String, Option<Vec<String>>)> {
@@ -341,17 +340,6 @@ fn run_json(argv: &[String], verb: &[&str], timeout: Duration) -> Result<Value, 
     serde_json::from_slice(&out.stdout).map_err(|e| format!("bad account json: {e}"))
 }
 
-/// A list-row form of a probe error; the detail pane keeps the full text.
-fn short_err(e: &str) -> String {
-    if e.starts_with("bad account json") {
-        return "unreadable account list".to_string();
-    }
-    match e.char_indices().nth(48) {
-        Some((i, _)) => format!("{}\u{2026}", &e[..i]),
-        None => e.to_string(),
-    }
-}
-
 /// A mutation verb through the plugin CLI; `Ok(stdout)` on success.
 fn account_cmd(argv: &[String], args: &[&str]) -> Result<String, String> {
     let (prog, base) = argv.split_first().ok_or("empty argv")?;
@@ -440,12 +428,31 @@ fn fetch_usage(argv: &[String]) -> Result<Vec<UsageEntry>, String> {
 }
 
 fn order_key(p: &Provider) -> (u8, String) {
-    let rank = match (p.plugin.as_str(), p.provider.as_str()) {
-        ("claude-sub", _) | (_, "claude") => 0,
-        ("codex-sub", _) | (_, "codex") => 1,
+    let name = display_name(p);
+    let rank = match name.as_str() {
+        "Claude" => 0,
+        "Codex" => 1,
         _ => 2,
     };
-    (rank, p.plugin.clone())
+    (rank, name)
+}
+
+/// The product a provider sells, not its plugin id: `claude-sub` → Claude.
+fn display_name(p: &Provider) -> String {
+    let id = p.provider.trim_end_matches("-subscription");
+    let id = id.trim_end_matches("-sub").trim_end_matches("-zen");
+    match id {
+        "chatgpt" => "ChatGPT".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        "lmstudio" => "LM Studio".to_string(),
+        "deepseek" => "DeepSeek".to_string(),
+        _ => {
+            let mut c = id.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect())
+                .unwrap_or_default()
+        }
+    }
 }
 
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -482,6 +489,9 @@ fn iso_epoch(s: &str) -> Option<i64> {
 
 fn countdown(resets_at: &str, now: i64) -> Option<String> {
     let left = iso_epoch(resets_at)? - now;
+    if left <= 0 {
+        return None;
+    }
     Some(if left >= 86_400 {
         format!("{}d", left / 86_400)
     } else if left >= 3_600 {
@@ -502,9 +512,9 @@ fn window_cell(w: &Value, now: i64) -> Option<String> {
     let reset = w["resets_at"]
         .as_str()
         .and_then(|at| countdown(at, now))
-        .map(|c| format!(" ↻{c}"))
+        .map(|c| format!("↻{c}"))
         .unwrap_or_default();
-    Some(format!("{label} {} {pct:.0}%{reset}", bar(pct)))
+    Some(format!("{label:<7} {} {pct:>3.0}% {reset:<5}", bar(pct)))
 }
 
 fn window_detail(w: &Value, now: i64) -> Option<String> {
@@ -523,7 +533,6 @@ enum Row {
     Ambient { provider: usize },
     AddHint { provider: usize },
     Vault { auth_ref: String, label: String },
-    Plain { provider: usize },
 }
 
 struct Panel {
@@ -565,19 +574,12 @@ impl Panel {
             let Some(provider) = manifest_provider(&home, &name) else {
                 continue;
             };
-            let (doc, probe_err) = match &argv {
-                Some(argv) => match probe_accounts(argv) {
-                    Ok(v) => (Some(v), None),
-                    Err(e) => (None, Some(e)),
-                },
-                None => (None, None),
-            };
+            let doc = argv.as_ref().and_then(|argv| probe_accounts(argv).ok());
             providers.push(Provider {
                 plugin: name,
                 provider,
                 argv,
                 doc,
-                probe_err,
             });
         }
         // Vault pools for providers without an answering plugin CLI get
@@ -596,7 +598,6 @@ impl Panel {
                 provider: provider_id,
                 argv: None,
                 doc: Some(json!({"_vault": auth_ref})),
-                probe_err: None,
             });
         }
         providers.sort_by_key(order_key);
@@ -611,8 +612,16 @@ impl Panel {
         let auth = auth_path().unwrap_or_default();
         self.rows.clear();
         for (i, p) in self.providers.iter().enumerate() {
+            let Some(doc) = &p.doc else {
+                continue;
+            };
+            let has_accounts = doc["accounts"].as_array().is_some_and(|l| !l.is_empty())
+                || doc.get("_vault").is_some();
+            if !has_accounts && self.not_connected(i) {
+                continue;
+            }
             self.rows.push(Row::Header { provider: i });
-            if let Some(doc) = &p.doc {
+            {
                 if let Some(auth_ref) = doc.get("_vault").and_then(Value::as_str) {
                     for r in vault_rows(&auth, auth_ref) {
                         self.rows.push(Row::Vault {
@@ -638,10 +647,9 @@ impl Panel {
                         self.rows.push(Row::AddHint { provider: i });
                     }
                 }
-            } else {
-                self.rows.push(Row::Plain { provider: i });
             }
         }
+        self.sel = self.sel.min(self.rows.len().saturating_sub(1));
     }
 
     fn start_usage(&mut self) {
@@ -709,6 +717,7 @@ impl Panel {
             };
             self.usage.insert(key, state);
         }
+        self.rebuild_rows();
     }
 
     fn pump_usage(&mut self) {
@@ -861,12 +870,14 @@ impl Panel {
                         }
                     })
                     .unwrap_or_default();
-                let mut line = format!("{}  ({})", p.plugin, p.provider);
-                if !strategy.is_empty() {
-                    line.push_str(&format!("   strategy {strategy}"));
-                }
-                if let Some(e) = &p.probe_err {
-                    line.push_str(&format!("   \u{2717} {}", short_err(e)));
+                let pooled = p
+                    .doc
+                    .as_ref()
+                    .and_then(|d| d["accounts"].as_array())
+                    .is_some_and(|l| l.len() > 1);
+                let mut line = display_name(p);
+                if pooled && !strategy.is_empty() {
+                    line.push_str(&format!("  \u{b7} {}", strategy.replace('_', " ")));
                 }
                 (line, true)
             }
@@ -892,7 +903,7 @@ impl Panel {
                     .map(|o| format!(" · {o}"))
                     .unwrap_or_default();
                 let usage = self.usage_cell(&p.plugin, Some(label.as_str()));
-                let mut line = format!("  {pin} {label:<12} {who}{org}{usage}");
+                let mut line = format!(" {pin} {label:<14} {who}{org}{usage}");
                 if a["cooling"].as_bool() == Some(true) {
                     let left = a["cooldown_until"]
                         .as_u64()
@@ -907,19 +918,16 @@ impl Panel {
             }
             Row::Ambient { provider } => {
                 if self.not_connected(*provider) {
-                    ("    not connected — a to log in".to_string(), false)
+                    ("   not connected \u{b7} a to log in".to_string(), false)
                 } else {
                     let plugin = &self.providers[*provider].plugin;
                     (
-                        format!(
-                            "    ambient login serves (no accounts yet){}",
-                            self.usage_cell(plugin, None)
-                        ),
+                        format!("   {:<14}{}", "signed in", self.usage_cell(plugin, None)),
                         false,
                     )
                 }
             }
-            Row::AddHint { .. } => ("    + add account".to_string(), false),
+            Row::AddHint { .. } => ("   + add account".to_string(), false),
             Row::Vault { auth_ref, label } => {
                 let detail = vault_rows(&auth, auth_ref)
                     .into_iter()
@@ -938,14 +946,7 @@ impl Panel {
                     None => (" ", "credential".to_string(), "?".to_string()),
                 };
                 (
-                    format!("  {pin} {label:<16} {who}   vault · {state}"),
-                    false,
-                )
-            }
-            Row::Plain { provider } => {
-                let p = &self.providers[*provider];
-                (
-                    format!("    {} — single login, no account pool", p.plugin),
+                    format!(" {pin} {label:<14} {who}   vault \u{b7} {state}"),
                     false,
                 )
             }
@@ -986,8 +987,7 @@ impl Panel {
             Row::Header { provider }
             | Row::Account { provider, .. }
             | Row::Ambient { provider }
-            | Row::AddHint { provider }
-            | Row::Plain { provider } => Some(*provider),
+            | Row::AddHint { provider } => Some(*provider),
             Row::Vault { .. } => None,
         }
     }
@@ -1120,6 +1120,7 @@ pub fn usage_picker() -> Value {
     panel.rebuild_rows();
     let auth = auth_path().unwrap_or_default();
     let mut items = Vec::new();
+    let mut any_pinned = false;
     let mut current = 0usize;
     for row in &panel.rows {
         let (provider, label, pinned, cooling) = match row {
@@ -1162,18 +1163,20 @@ pub fn usage_picker() -> Value {
         if cells.is_empty() && pinned {
             cells = panel.usage_cell(plugin, None);
         }
-        let mut desc = match cells.trim() {
-            "" => "no quota reported".to_string(),
-            c => c.to_string(),
-        };
+        if cells.trim().is_empty() || cells.trim() == "\u{2026}" {
+            continue;
+        }
+        let mut desc = cells.trim().to_string();
         if let Some(until) = cooling {
             let left = until.saturating_sub(now_secs());
             desc.push_str(&format!("   cooling {}m{:02}s", left / 60, left % 60));
         }
-        let mark = if pinned { "● " } else { "  " };
+        any_pinned |= pinned;
+        let mark = if pinned { "\u{25cf} " } else { "" };
+        let product = display_name(&panel.providers[provider]);
         let name = match &label {
-            Some(l) => format!("{mark}{plugin} · {l}"),
-            None => format!("{mark}{plugin}"),
+            Some(l) => format!("{mark}{product} \u{b7} {l}"),
+            None => format!("{mark}{product}"),
         };
         items.push(json!({
             "id": format!("{plugin}/{}", label.as_deref().unwrap_or("")),
@@ -1184,11 +1187,16 @@ pub fn usage_picker() -> Value {
     if items.is_empty() {
         return json!({ "text": "no logins report usage yet. /connect adds an account" });
     }
+    let footer = if any_pinned {
+        "\u{25cf} pinned account \u{b7} /accounts manages logins"
+    } else {
+        "/accounts manages logins"
+    };
     json!({
         "picker": {
             "title": "Usage",
             "items": items,
-            "footer": "● pinned account · /connect manages accounts",
+            "footer": footer,
         },
     })
 }
@@ -1378,6 +1386,9 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                         )));
                     }
                     for (i, row) in panel.rows.iter().enumerate() {
+                        if i > 0 && matches!(row, Row::Header { .. }) {
+                            body.push(Line::default());
+                        }
                         let (text, header) = panel.row_text(row);
                         let hint = matches!(row, Row::AddHint { .. })
                             || matches!(row, Row::Ambient { provider } if panel.not_connected(*provider));
