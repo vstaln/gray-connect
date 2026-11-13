@@ -857,6 +857,20 @@ impl Panel {
     }
 
     fn open_detail(&mut self) {
+        if let Some(Row::AddHint { provider }) = self.selected_row() {
+            let provider = *provider;
+            if self.providers[provider].argv.is_some() {
+                self.mode = Mode::Adding {
+                    provider,
+                    buf: String::new(),
+                };
+                self.status = None;
+            } else {
+                self.status =
+                    Some("no account CLI for this provider \u{2014} add via /connect".into());
+            }
+            return;
+        }
         let next = match self.selected_row() {
             Some(Row::Account { provider, label }) => Some((*provider, Some(label.clone()))),
             Some(Row::Ambient { provider }) => Some((*provider, None)),
@@ -973,7 +987,11 @@ impl Panel {
                     .map(|o| format!(" · {o}"))
                     .unwrap_or_default();
                 let (_, usage) = self.usage_lines(&p.plugin, Some(label.as_str()));
-                let mut line = format!(" {pin} {label:<14} {who}{org}");
+                let mut line = if label.is_empty() {
+                    format!("  {who}{org}")
+                } else {
+                    format!(" {pin} {label:<14} {who}{org}")
+                };
                 if a["cooling"].as_bool() == Some(true) {
                     let left = a["cooldown_until"]
                         .as_u64()
@@ -1002,7 +1020,7 @@ impl Panel {
                     (line, false)
                 }
             }
-            Row::AddHint { .. } => ("   + add account".to_string(), false),
+            Row::AddHint { .. } => ("  + add account".to_string(), false),
             Row::Vault { auth_ref, label } => {
                 let detail = vault_rows(&auth, auth_ref)
                     .into_iter()
@@ -1352,6 +1370,11 @@ pub fn run() -> anyhow::Result<()> {
                 let mut line = String::new();
                 let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line);
                 panel.refresh();
+                panel.status = Some(if status.success() {
+                    format!("added {label}")
+                } else {
+                    format!("account add exited {status}")
+                });
             }
         }
     }
@@ -1456,7 +1479,12 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                 Mode::Detail { plugin, label } => panel.index_of(plugin, label.as_deref()),
                 _ => None,
             };
-            let mut body: Vec<Line> = Vec::new();
+            struct Ln {
+                left: Vec<(String, Style)>,
+                right: Vec<(String, Style)>,
+                rule: bool,
+            }
+            let mut body: Vec<Ln> = Vec::new();
             let mut sel_line = None;
             let all_gauges: Vec<Option<Vec<Gauge>>> =
                 panel.rows.iter().map(|r| panel.gauges(r)).collect();
@@ -1481,20 +1509,29 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
             {
                 {
                     if listing && panel.rows.is_empty() {
-                        body.push(Line::from(Span::styled(
-                            "no provider plugins installed, /connect to add one",
-                            fg(th.faint),
-                        )));
+                        body.push(Ln {
+                            left: vec![(
+                                "no provider plugins installed, /connect to add one".to_string(),
+                                fg(th.faint),
+                            )],
+                            right: Vec::new(),
+                            rule: false,
+                        });
                     }
                     for &i in &shown {
                         let row = &panel.rows[i];
                         if listing && i > 0 && matches!(row, Row::Header { .. }) {
-                            body.push(Line::default());
+                            body.push(Ln {
+                                left: Vec::new(),
+                                right: Vec::new(),
+                                rule: false,
+                            });
                         }
                         let (text, header) = panel.row_text(row);
                         let hint = matches!(row, Row::AddHint { .. })
                             || matches!(row, Row::Ambient { provider } if panel.not_connected(*provider));
-                        let style = if listing && i == panel.sel {
+                        let selected = listing && i == panel.sel;
+                        let style = if selected {
                             sel_line = Some(body.len());
                             fg(th.on_selection).add_modifier(Modifier::BOLD)
                         } else if header {
@@ -1505,20 +1542,34 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                             fg(th.body)
                         };
                         let head = text.split('\n').next().unwrap_or_default().to_string();
-                        let mut head_spans = vec![Span::styled(head, style)];
+                        let mut right: Vec<(String, Style)> = Vec::new();
+                        if let Row::Header { provider } = row {
+                            let p = &panel.providers[*provider];
+                            let n = p
+                                .doc
+                                .as_ref()
+                                .and_then(|d| d["accounts"].as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            if n > 1 {
+                                right.push((format!("{n} accounts"), fg(th.dim)));
+                            }
+                        }
                         if panel.pending(row) {
-                            head_spans.push(Span::styled("   \u{2026}", fg(th.faint)));
+                            right.push(("\u{2026}".to_string(), fg(th.faint)));
                         }
-                        if !listing {
-                            head_spans[0] = Span::styled(
-                                head_spans[0].content.to_string(),
-                                fg(th.bright).add_modifier(Modifier::BOLD),
-                            );
-                        }
-                        body.push(Line::from(head_spans));
+                        body.push(Ln {
+                            left: vec![(head, style)],
+                            right,
+                            rule: header,
+                        });
                         let Some(gauges) = &all_gauges[i] else {
                             for part in text.split('\n').skip(1) {
-                                body.push(Line::from(Span::styled(part.to_string(), fg(th.body))));
+                                body.push(Ln {
+                                    left: vec![(part.to_string(), fg(th.body))],
+                                    right: Vec::new(),
+                                    rule: false,
+                                });
                             }
                             continue;
                         };
@@ -1531,26 +1582,39 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                             } else {
                                 th.muted
                             };
-                            body.push(Line::from(vec![
-                                Span::styled(
-                                    format!("      {:<label_w$}  ", g.label),
-                                    fg(th.dim),
-                                ),
-                                Span::styled("\u{2501}".repeat(filled), fg(tone)),
-                                Span::styled("\u{2501}".repeat(empty), fg(th.faint)),
-                                Span::styled(format!("  {:>3.0}%", g.pct), fg(if g.pct >= 70.0 { tone } else { th.body })),
-                                Span::styled(
-                                    g.reset.as_ref().map(|r| format!("   {r}")).unwrap_or_default(),
-                                    fg(th.faint),
-                                ),
-                            ]));
+                            let full = if selected { fg(th.on_selection) } else { fg(tone) };
+                            let rest = if selected { fg(th.on_selection) } else { fg(th.faint) };
+                            let num = if selected {
+                                fg(th.on_selection)
+                            } else {
+                                fg(if g.pct >= 70.0 { tone } else { th.body })
+                            };
+                            let reset = g
+                                .reset
+                                .as_ref()
+                                .map(|r| format!("{r:>14}"))
+                                .unwrap_or_else(|| " ".repeat(14));
+                            body.push(Ln {
+                                left: vec![(
+                                    format!("  {:<label_w$}", g.label),
+                                    if selected { fg(th.on_selection) } else { fg(th.dim) },
+                                )],
+                                rule: false,
+                                right: vec![
+                                    ("\u{2501}".repeat(filled), full),
+                                    ("\u{2500}".repeat(empty), rest),
+                                    (format!(" {:>3.0}%", g.pct), num),
+                                    (format!("  {reset}"), rest),
+                                ],
+                            });
                         }
                         if let Some((plugin, label)) = detail_for(i) {
                             for extra in panel.detail_extras(&plugin, label.as_deref()) {
-                                body.push(Line::from(Span::styled(
-                                    format!("      {extra}"),
-                                    fg(th.dim),
-                                )));
+                                body.push(Ln {
+                                    left: vec![(format!("  {extra}"), fg(th.dim))],
+                                    right: Vec::new(),
+                                    rule: false,
+                                });
                             }
                         }
                     }
@@ -1594,7 +1658,12 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
             };
 
             let keys_w: usize = keys.iter().map(|(k, l)| k.chars().count() + l.chars().count() + 4).sum();
-            let widest = body.iter().map(Line::width).max().unwrap_or(0).max(keys_w);
+            let ln_w = |l: &Ln| -> usize {
+                let lw: usize = l.left.iter().map(|(t, _)| t.chars().count()).sum();
+                let rw: usize = l.right.iter().map(|(t, _)| t.chars().count()).sum();
+                lw + if rw == 0 { 0 } else { rw + 2 }
+            };
+            let widest = body.iter().map(ln_w).max().unwrap_or(0).max(keys_w);
             let modal_w = (widest as u16 + 4).clamp(64, 116).min(area.width.saturating_sub(2));
             // header, gap, body, gap, notes, keys
             let want = body.len() as u16 + notes.len() as u16 + 6;
@@ -1618,10 +1687,30 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                 },
                 _ => "Accounts".to_string(),
             };
+            let shown_providers = panel
+                .rows
+                .iter()
+                .filter(|r| matches!(r, Row::Header { .. }))
+                .count();
+            let accounts = panel
+                .rows
+                .iter()
+                .filter(|r| matches!(r, Row::Account { .. } | Row::Vault { .. } | Row::Ambient { .. }))
+                .count();
+            let counts = match accounts {
+                0 => String::new(),
+                n => format!("{n} account{}", if n == 1 { "" } else { "s" }),
+            };
+            let _ = shown_providers;
+            let tpad = (inner.width as usize)
+                .saturating_sub(4 + title.chars().count() + counts.chars().count())
+                .max(2);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(title, fg(th.bright).add_modifier(Modifier::BOLD)),
+                    Span::raw(" ".repeat(tpad)),
+                    Span::styled(counts, fg(th.faint)),
                 ])),
                 row(inner.y),
             );
@@ -1629,14 +1718,36 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
             let list_y = inner.y + 2;
             let list_h = bottom.saturating_sub(list_y + 2 + notes.len() as u16) as usize;
             let start = sel_line.map_or(0, |s| s.saturating_sub(list_h.saturating_sub(1)));
-            for (vi, mut line) in body.into_iter().enumerate().skip(start).take(list_h) {
-                line.spans.insert(0, Span::raw("  "));
+            for (vi, ln) in body.into_iter().enumerate().skip(start).take(list_h) {
+                let lw: usize = ln.left.iter().map(|(t, _)| t.chars().count()).sum();
+                let rw: usize = ln.right.iter().map(|(t, _)| t.chars().count()).sum();
+                let pad = (inner.width as usize)
+                    .saturating_sub(2 + lw + rw)
+                    .max(if rw == 0 { 0 } else { 2 });
+                let mut spans: Vec<Span> = vec![Span::raw("  ")];
+                for (t, st) in ln.left {
+                    spans.push(Span::styled(t, st));
+                }
+                if ln.rule && pad >= 4 {
+                    let line = if sel_line == Some(vi) { th.on_selection } else { th.faint };
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled("\u{2500}".repeat(pad - 2), fg(line)));
+                    spans.push(Span::raw(" "));
+                } else {
+                    spans.push(Span::raw(" ".repeat(pad)));
+                }
+                for (t, st) in ln.right {
+                    spans.push(Span::styled(t, st));
+                }
                 let bar = if sel_line == Some(vi) {
                     Style::default().bg(th.accent)
                 } else {
                     Style::default()
                 };
-                frame.render_widget(Paragraph::new(line).style(bar), row(list_y + (vi - start) as u16));
+                frame.render_widget(
+                    Paragraph::new(Line::from(spans)).style(bar),
+                    row(list_y + (vi - start) as u16),
+                );
             }
             let keys_y = bottom.saturating_sub(1);
             for (n, mut line) in notes.into_iter().enumerate() {
