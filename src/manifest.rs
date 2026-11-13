@@ -1,6 +1,6 @@
 //! The plugin manifest gray reads at install and sidecar startup.
 
-/// `/connect` (alias `/accounts`) hands the terminal to the panel; `/usage`
+/// `/accounts` hands the terminal to the panel; `/usage`
 /// prints the same usage data as plain text for a host without a tty, and
 /// runs mid-turn instead of queueing behind the running turn.
 pub fn manifest() -> serde_json::Value {
@@ -11,7 +11,11 @@ pub fn manifest() -> serde_json::Value {
         "tools": [],
         "hooks": [],
         "capabilities": [],
-        "commands": ["/connect", "/accounts", "/usage"],
+        "commands": ["/accounts", "/usage"],
+        "command_descriptions": {
+            "/accounts": "Manage provider logins: add, pin, remove, rotate accounts",
+            "/usage": "Show quota used and reset times for each login",
+        },
         "completion": ["accounts", "usage"],
         "turn_local": { "/usage": ["*"] },
     })

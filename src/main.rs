@@ -16,7 +16,7 @@ usage: gray-connect <command> [args]
        (the same commands run as `gray connect <command>` in the gray CLI)
 
 commands:
-  accounts          the /connect panel (pin, add, remove, strategy)
+  accounts          the /accounts panel (pin, add, remove, strategy)
   usage             usage cards for every provider pool, as plain text
   manifest          print the plugin manifest (used by gray at install)
   version           print the version

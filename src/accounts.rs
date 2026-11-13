@@ -1,4 +1,4 @@
-//! `/connect` (alias `/accounts`) — provider account pools panel.
+//! `/accounts` — provider account pools panel.
 //!
 //! Moved out of gray core (`repl/accounts_panel.rs`) and then out of
 //! gray-account: this plugin owns the whole surface. Two credential-
@@ -501,30 +501,47 @@ fn countdown(resets_at: &str, now: i64) -> Option<String> {
     })
 }
 
-fn bar(pct: f64) -> String {
-    let filled = (pct.clamp(0.0, 100.0) * 12.0 / 100.0).ceil() as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(12 - filled))
+struct Gauge {
+    label: String,
+    pct: f64,
+    reset: Option<String>,
 }
 
-fn window_cell(w: &Value, now: i64) -> Option<String> {
-    let label = w["label"].as_str().or_else(|| w["id"].as_str())?;
-    let pct = w["used_percent"].as_f64()?;
-    let reset = w["resets_at"]
-        .as_str()
-        .and_then(|at| countdown(at, now))
-        .map(|c| format!("resets in {c}"))
+fn gauge(w: &Value, now: i64) -> Option<Gauge> {
+    Some(Gauge {
+        label: w["label"]
+            .as_str()
+            .or_else(|| w["id"].as_str())?
+            .to_string(),
+        pct: w["used_percent"].as_f64()?,
+        reset: w["resets_at"]
+            .as_str()
+            .and_then(|at| countdown(at, now))
+            .map(|c| format!("resets in {c}")),
+    })
+}
+
+const CELLS: usize = 16;
+
+fn cells(pct: f64) -> (usize, usize) {
+    let filled = ((pct.clamp(0.0, 100.0) * CELLS as f64 / 100.0).round() as usize).min(CELLS);
+    (filled, CELLS - filled)
+}
+
+fn gauge_text(g: &Gauge, label_w: usize) -> String {
+    let (filled, empty) = cells(g.pct);
+    let reset = g
+        .reset
+        .as_ref()
+        .map(|r| format!("   {r}"))
         .unwrap_or_default();
-    Some(format!("{label:<15} {}  {pct:>3.0}%  {reset}", bar(pct)))
-}
-
-fn window_detail(w: &Value, now: i64) -> Option<String> {
-    let label = w["label"].as_str().or_else(|| w["id"].as_str())?;
-    let pct = w["used_percent"].as_f64()?;
-    let reset = match w["resets_at"].as_str().and_then(|at| countdown(at, now)) {
-        Some(c) => format!("resets in {c}"),
-        None => "reset time unknown".to_string(),
-    };
-    Some(format!("{label:<5} {}  {pct:>3.0}%   {reset}", bar(pct)))
+    format!(
+        "{:<label_w$}  {}{}  {:>3.0}%{reset}",
+        g.label,
+        "\u{2501}".repeat(filled),
+        "\u{2502}".repeat(empty),
+        g.pct
+    )
 }
 
 enum Row {
@@ -751,16 +768,70 @@ impl Panel {
             Some(Fetch::Pending) => (None, vec!["\u{2026}".to_string()]),
             Some(Fetch::Loaded(card)) => {
                 let now = now_secs() as i64;
-                let lines = card["windows"]
+                let gauges: Vec<Gauge> = card["windows"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .filter_map(|w| window_cell(w, now))
+                    .filter_map(|w| gauge(w, now))
                     .collect();
+                let w = gauges
+                    .iter()
+                    .map(|g| g.label.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                let lines = gauges.iter().map(|g| gauge_text(g, w)).collect();
                 (card["email"].as_str().map(str::to_string), lines)
             }
             _ => (None, Vec::new()),
         }
+    }
+
+    fn gauges(&self, row: &Row) -> Option<Vec<Gauge>> {
+        let key = match row {
+            Row::Account { provider, label } => (
+                self.providers[*provider].plugin.clone(),
+                Some(label.clone()),
+            ),
+            Row::Ambient { provider } if !self.not_connected(*provider) => {
+                (self.providers[*provider].plugin.clone(), None)
+            }
+            _ => return None,
+        };
+        match self.usage.get(&key) {
+            Some(Fetch::Pending) => Some(Vec::new()),
+            Some(Fetch::Loaded(card)) => {
+                let now = now_secs() as i64;
+                Some(
+                    card["windows"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|w| gauge(w, now))
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    fn pending(&self, row: &Row) -> bool {
+        let key = match row {
+            Row::Account { provider, label } => (
+                self.providers[*provider].plugin.clone(),
+                Some(label.clone()),
+            ),
+            Row::Ambient { provider } => (self.providers[*provider].plugin.clone(), None),
+            _ => return false,
+        };
+        matches!(self.usage.get(&key), Some(Fetch::Pending))
+    }
+
+    fn pooled(&self, provider: usize) -> bool {
+        self.providers[provider]
+            .doc
+            .as_ref()
+            .and_then(|d| d["accounts"].as_array())
+            .is_some_and(|l| l.len() > 1)
     }
 
     /// The provider answered `account usage` for its ambient login with an
@@ -799,24 +870,28 @@ impl Panel {
         }
     }
 
-    fn detail_lines(&self, plugin: &str, label: Option<&str>) -> Vec<String> {
-        let now = now_secs() as i64;
-        let Some(p) = self.providers.iter().find(|p| p.plugin == plugin) else {
-            return Vec::new();
-        };
-        let who = label.unwrap_or("ambient login");
-        let mut out = vec![format!("{who}   {}  ({})", p.plugin, p.provider)];
+    fn index_of(&self, plugin: &str, label: Option<&str>) -> Option<usize> {
+        self.rows.iter().position(|row| match row {
+            Row::Account { provider, label: l } => {
+                self.providers[*provider].plugin == plugin && Some(l.as_str()) == label
+            }
+            Row::Ambient { provider } => {
+                self.providers[*provider].plugin == plugin && label.is_none()
+            }
+            _ => false,
+        })
+    }
+
+    fn detail_extras(&self, plugin: &str, label: Option<&str>) -> Vec<String> {
+        let mut out = Vec::new();
         let key = (plugin.to_string(), label.map(str::to_string));
         match self.usage.get(&key) {
-            Some(Fetch::Pending) | None => out.push("loading usage…".to_string()),
+            Some(Fetch::Pending) | None => out.push("loading usage\u{2026}".to_string()),
             Some(Fetch::Unsupported) => out.push("no usage from this plugin".to_string()),
             Some(Fetch::Failed(e)) => out.push(format!("\u{2717} {e}")),
             Some(Fetch::Loaded(card)) => {
                 if let Some(plan) = card["plan"].as_str() {
                     out.push(format!("plan {plan}"));
-                }
-                for w in card["windows"].as_array().into_iter().flatten() {
-                    out.extend(window_detail(w, now));
                 }
                 if let Some(note) = card["note"].as_str() {
                     out.push(note.to_string());
@@ -1188,7 +1263,7 @@ pub fn usage_picker() -> Value {
         }
     }
     if items.is_empty() {
-        return json!({ "text": "no logins report usage yet. /connect adds an account" });
+        return json!({ "text": "no logins report usage yet. /accounts adds an account" });
     }
     let footer = if any_pinned {
         "\u{25cf} pinned account \u{b7} /accounts manages logins"
@@ -1241,7 +1316,7 @@ enum Outcome {
     },
 }
 
-/// Interactive `/connect`: the ratatui panel. Runs standalone as
+/// Interactive `/accounts`: the ratatui panel. Runs standalone as
 /// `gray-connect accounts` (the TUI verb inside a `{"terminal":…}`
 /// handoff).
 pub fn run() -> anyhow::Result<()> {
@@ -1352,13 +1427,19 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
 
     terminal::enable_raw_mode()?;
     let mut out = std::io::stdout();
-    execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
+    execute!(
+        out,
+        terminal::EnterAlternateScreen,
+        cursor::Hide,
+        crossterm::event::EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
     let restore = |term: &mut Terminal<CrosstermBackend<std::io::Stdout>>| {
         let _ = execute!(
             term.backend_mut(),
             cursor::Show,
+            crossterm::event::DisableBracketedPaste,
             terminal::LeaveAlternateScreen
         );
         let _ = terminal::disable_raw_mode();
@@ -1371,31 +1452,49 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                 return;
             }
             let fg = |c| Style::default().fg(c);
-            let detail = match &panel.mode {
-                Mode::Detail { plugin, label } => {
-                    Some(panel.detail_lines(plugin, label.as_deref()))
-                }
+            let detail_idx = match &panel.mode {
+                Mode::Detail { plugin, label } => panel.index_of(plugin, label.as_deref()),
                 _ => None,
             };
             let mut body: Vec<Line> = Vec::new();
             let mut sel_line = None;
-            match &detail {
-                Some(text) => body.extend(text.iter().map(|t| Line::from(Span::styled(t.clone(), fg(th.body))))),
-                None => {
-                    if panel.rows.is_empty() {
+            let all_gauges: Vec<Option<Vec<Gauge>>> =
+                panel.rows.iter().map(|r| panel.gauges(r)).collect();
+            let label_w = all_gauges
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|g| g.label.chars().count())
+                .max()
+                .unwrap_or(0);
+            let detail_for = |i: usize| match &panel.mode {
+                Mode::Detail { plugin, label } if detail_idx == Some(i) => {
+                    Some((plugin.clone(), label.clone()))
+                }
+                _ => None,
+            };
+            let listing = !matches!(panel.mode, Mode::Detail { .. });
+            let shown: Vec<usize> = match detail_idx {
+                Some(i) if !listing => vec![i],
+                _ => (0..panel.rows.len()).collect(),
+            };
+            {
+                {
+                    if listing && panel.rows.is_empty() {
                         body.push(Line::from(Span::styled(
                             "no provider plugins installed, /connect to add one",
                             fg(th.faint),
                         )));
                     }
-                    for (i, row) in panel.rows.iter().enumerate() {
-                        if i > 0 && matches!(row, Row::Header { .. }) {
+                    for &i in &shown {
+                        let row = &panel.rows[i];
+                        if listing && i > 0 && matches!(row, Row::Header { .. }) {
                             body.push(Line::default());
                         }
                         let (text, header) = panel.row_text(row);
                         let hint = matches!(row, Row::AddHint { .. })
                             || matches!(row, Row::Ambient { provider } if panel.not_connected(*provider));
-                        let style = if i == panel.sel {
+                        let style = if listing && i == panel.sel {
                             sel_line = Some(body.len());
                             fg(th.on_selection).add_modifier(Modifier::BOLD)
                         } else if header {
@@ -1405,8 +1504,54 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                         } else {
                             fg(th.body)
                         };
-                        for part in text.split('\n') {
-                            body.push(Line::from(Span::styled(part.to_string(), style)));
+                        let head = text.split('\n').next().unwrap_or_default().to_string();
+                        let mut head_spans = vec![Span::styled(head, style)];
+                        if panel.pending(row) {
+                            head_spans.push(Span::styled("   \u{2026}", fg(th.faint)));
+                        }
+                        if !listing {
+                            head_spans[0] = Span::styled(
+                                head_spans[0].content.to_string(),
+                                fg(th.bright).add_modifier(Modifier::BOLD),
+                            );
+                        }
+                        body.push(Line::from(head_spans));
+                        let Some(gauges) = &all_gauges[i] else {
+                            for part in text.split('\n').skip(1) {
+                                body.push(Line::from(Span::styled(part.to_string(), fg(th.body))));
+                            }
+                            continue;
+                        };
+                        for g in gauges {
+                            let (filled, empty) = cells(g.pct);
+                            let tone = if g.pct >= 90.0 {
+                                ratatui::style::Color::Rgb(232, 112, 112)
+                            } else if g.pct >= 70.0 {
+                                th.accent
+                            } else {
+                                th.muted
+                            };
+                            body.push(Line::from(vec![
+                                Span::styled(
+                                    format!("      {:<label_w$}  ", g.label),
+                                    fg(th.dim),
+                                ),
+                                Span::styled("\u{2501}".repeat(filled), fg(tone)),
+                                Span::styled("\u{2501}".repeat(empty), fg(th.faint)),
+                                Span::styled(format!("  {:>3.0}%", g.pct), fg(if g.pct >= 70.0 { tone } else { th.body })),
+                                Span::styled(
+                                    g.reset.as_ref().map(|r| format!("   {r}")).unwrap_or_default(),
+                                    fg(th.faint),
+                                ),
+                            ]));
+                        }
+                        if let Some((plugin, label)) = detail_for(i) {
+                            for extra in panel.detail_extras(&plugin, label.as_deref()) {
+                                body.push(Line::from(Span::styled(
+                                    format!("      {extra}"),
+                                    fg(th.dim),
+                                )));
+                            }
                         }
                     }
                 }
@@ -1414,9 +1559,10 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
             let mut notes: Vec<Line> = Vec::new();
             if let Mode::Adding { buf, .. } = &panel.mode {
                 notes.push(Line::from(vec![
-                    Span::styled("new account label ", fg(th.dim)),
-                    Span::styled(if buf.is_empty() { "home".to_string() } else { buf.clone() }, fg(th.bright)),
+                    Span::styled("name this account  ", fg(th.dim)),
+                    Span::styled(buf.clone(), fg(th.bright)),
                     Span::styled("▌", fg(th.accent)),
+                    Span::styled(if buf.is_empty() { "e.g. work" } else { "" }, fg(th.faint)),
                 ]));
             }
             if let Some(msg) = &panel.status {
@@ -1427,14 +1573,21 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                 Mode::Adding { .. } => &[("enter", "add"), ("esc", "cancel")],
                 Mode::ConfirmRemove { .. } => &[("d", "confirm remove"), ("esc", "cancel")],
                 Mode::Running { .. } => &[],
-                Mode::List => &[
+                Mode::List if panel.row_provider().is_some_and(|p| panel.pooled(p)) => &[
                     ("↑↓", "move"),
                     ("enter", "detail"),
                     ("a", "add"),
                     ("p", "pin"),
                     ("c", "unpin"),
-                    ("d", "remove"),
                     ("s", "strategy"),
+                    ("d", "remove"),
+                    ("esc", "close"),
+                ],
+                Mode::List => &[
+                    ("↑↓", "move"),
+                    ("enter", "detail"),
+                    ("a", "add"),
+                    ("d", "remove"),
                     ("r", "refresh"),
                     ("esc", "close"),
                 ],
@@ -1503,12 +1656,17 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
         if !poll(Duration::from_millis(100))? {
             continue;
         }
+        let event = read()?;
+        if let (Mode::Adding { buf, .. }, Event::Paste(text)) = (&mut panel.mode, &event) {
+            buf.extend(text.chars().filter(|c| !c.is_control()));
+            continue;
+        }
         let Event::Key(KeyEvent {
             code,
             kind,
             modifiers,
             ..
-        }) = read()?
+        }) = event
         else {
             continue;
         };
@@ -1541,7 +1699,7 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                             };
                         }
                     }
-                    _ => panel.status = Some("add needs a label".into()),
+                    _ => panel.status = Some("type a name first".into()),
                 }
             }
             (Mode::Adding { buf, .. }, KeyCode::Backspace) => {
