@@ -517,7 +517,7 @@ fn gauge(w: &Value, now: i64) -> Option<Gauge> {
         reset: w["resets_at"]
             .as_str()
             .and_then(|at| countdown(at, now))
-            .map(|c| format!("resets in {c}")),
+            .map(|c| format!("resets in {c:>5}")),
     })
 }
 
@@ -634,7 +634,7 @@ impl Panel {
             };
             let has_accounts = doc["accounts"].as_array().is_some_and(|l| !l.is_empty())
                 || doc.get("_vault").is_some();
-            if !has_accounts && self.not_connected(i) {
+            if !has_accounts && self.not_connected(i) && doc["ambient"] != true {
                 continue;
             }
             self.rows.push(Row::Header { provider: i });
@@ -1009,7 +1009,16 @@ impl Panel {
             }
             Row::Ambient { provider } => {
                 if self.not_connected(*provider) {
-                    ("   not connected \u{b7} a to log in".to_string(), false)
+                    let msg = if self.providers[*provider]
+                        .doc
+                        .as_ref()
+                        .is_some_and(|d| d["ambient"] == true)
+                    {
+                        "   login expired \u{b7} a to log in again"
+                    } else {
+                        "   not connected \u{b7} a to log in"
+                    };
+                    (msg.to_string(), false)
                 } else {
                     let plugin = &self.providers[*provider].plugin;
                     let (email, usage) = self.usage_lines(plugin, None);
@@ -1592,8 +1601,8 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                             let reset = g
                                 .reset
                                 .as_ref()
-                                .map(|r| format!("{r:>14}"))
-                                .unwrap_or_else(|| " ".repeat(14));
+                                .map(|r| format!("{r:>15}"))
+                                .unwrap_or_else(|| " ".repeat(15));
                             body.push(Ln {
                                 left: vec![(
                                     format!("  {:<label_w$}", g.label),
