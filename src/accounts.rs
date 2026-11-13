@@ -940,31 +940,7 @@ impl Panel {
     fn row_text(&self, row: &Row) -> (String, bool) {
         let auth = auth_path().unwrap_or_default();
         match row {
-            Row::Header { provider } => {
-                let p = &self.providers[*provider];
-                let strategy = p
-                    .doc
-                    .as_ref()
-                    .and_then(|d| {
-                        if d.get("_vault").is_some() {
-                            let auth_ref = d["_vault"].as_str().unwrap_or_default();
-                            vault_meta(&auth, auth_ref).map(|(st, _)| st)
-                        } else {
-                            d["strategy"].as_str().map(str::to_string)
-                        }
-                    })
-                    .unwrap_or_default();
-                let pooled = p
-                    .doc
-                    .as_ref()
-                    .and_then(|d| d["accounts"].as_array())
-                    .is_some_and(|l| l.len() > 1);
-                let mut line = display_name(p);
-                if pooled && !strategy.is_empty() {
-                    line.push_str(&format!("  \u{b7} {}", strategy.replace('_', " ")));
-                }
-                (line, true)
-            }
+            Row::Header { provider } => (display_name(&self.providers[*provider]), true),
             Row::Account { provider, label } => {
                 let p = &self.providers[*provider];
                 let a = p.doc.as_ref().and_then(|d| {
@@ -1009,12 +985,24 @@ impl Panel {
             }
             Row::Ambient { provider } => {
                 if self.not_connected(*provider) {
-                    let msg = if self.providers[*provider]
+                    let key = (self.providers[*provider].plugin.clone(), None);
+                    let auth = match self.usage.get(&key) {
+                        Some(Fetch::Failed(e)) => {
+                            let e = e.to_lowercase();
+                            ["401", "403", "unauthorized", "expired", "login", "auth"]
+                                .iter()
+                                .any(|w| e.contains(w))
+                        }
+                        _ => false,
+                    };
+                    let ambient = self.providers[*provider]
                         .doc
                         .as_ref()
-                        .is_some_and(|d| d["ambient"] == true)
-                    {
+                        .is_some_and(|d| d["ambient"] == true);
+                    let msg = if ambient && auth {
                         "   login expired \u{b7} a to log in again"
+                    } else if ambient {
+                        "   usage unavailable \u{b7} r to retry"
                     } else {
                         "   not connected \u{b7} a to log in"
                     };
@@ -1666,7 +1654,10 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                 ],
             };
 
-            let keys_w: usize = keys.iter().map(|(k, l)| k.chars().count() + l.chars().count() + 4).sum();
+            let keys_w: usize = [("↑↓", "move"), ("enter", "detail"), ("a", "add"), ("p", "pin"), ("c", "unpin"), ("s", "strategy"), ("d", "remove"), ("esc", "close")]
+                .iter()
+                .map(|(k, l)| k.chars().count() + l.chars().count() + 4)
+                .sum();
             let ln_w = |l: &Ln| -> usize {
                 let lw: usize = l.left.iter().map(|(t, _)| t.chars().count()).sum();
                 let rw: usize = l.right.iter().map(|(t, _)| t.chars().count()).sum();
@@ -1675,7 +1666,7 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
             let widest = body.iter().map(ln_w).max().unwrap_or(0).max(keys_w);
             let modal_w = (widest as u16 + 4).clamp(64, 116).min(area.width.saturating_sub(2));
             // header, gap, body, gap, notes, keys
-            let want = body.len() as u16 + notes.len() as u16 + 6;
+            let want = body.len() as u16 + notes.len().max(1) as u16 + 6;
             let modal_h = want.min(area.height.saturating_sub(2));
             let rect = Rect::new(
                 area.x + (area.width.saturating_sub(modal_w)) / 2,
@@ -1725,7 +1716,7 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
             );
 
             let list_y = inner.y + 2;
-            let list_h = bottom.saturating_sub(list_y + 2 + notes.len() as u16) as usize;
+            let list_h = bottom.saturating_sub(list_y + 2 + notes.len().max(1) as u16) as usize;
             let start = sel_line.map_or(0, |s| s.saturating_sub(list_h.saturating_sub(1)));
             for (vi, ln) in body.into_iter().enumerate().skip(start).take(list_h) {
                 let lw: usize = ln.left.iter().map(|(t, _)| t.chars().count()).sum();
