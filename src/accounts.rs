@@ -1200,100 +1200,6 @@ pub fn text() -> String {
     render_text(true)
 }
 
-/// `/usage` as a host picker: one row per login that can answer for quota,
-/// usage bars on the right. Providers without a login or without account
-/// support stay out of the list; `/connect` is where those are managed.
-pub fn usage_picker() -> Value {
-    let mut panel = Panel::load();
-    panel.start_usage();
-    panel.await_usage(USAGE_TIMEOUT + Duration::from_secs(2));
-    panel.rebuild_rows();
-    let auth = auth_path().unwrap_or_default();
-    let mut items = Vec::new();
-    let mut any_pinned = false;
-    let mut current = 0usize;
-    for row in &panel.rows {
-        let (provider, label, pinned, cooling) = match row {
-            Row::Header { provider } => {
-                current = *provider;
-                continue;
-            }
-            Row::Account { provider, label } => {
-                let a = panel.providers[*provider].doc.as_ref().and_then(|d| {
-                    d["accounts"]
-                        .as_array()?
-                        .iter()
-                        .find(|x| x["label"].as_str() == Some(label))
-                        .cloned()
-                });
-                let a = a.unwrap_or_default();
-                let left = a["cooldown_until"].as_u64().unwrap_or(0);
-                (
-                    *provider,
-                    Some(label.clone()),
-                    a["pinned"].as_bool() == Some(true),
-                    (a["cooling"].as_bool() == Some(true)).then_some(left),
-                )
-            }
-            Row::Vault { auth_ref, label } => {
-                let r = vault_rows(&auth, auth_ref)
-                    .into_iter()
-                    .find(|r| r.label == *label);
-                let pinned = r.as_ref().is_some_and(|r| r.pinned);
-                let cooling = r.filter(|r| r.cooling).map(|r| r.cooldown_until);
-                (current, Some(label.clone()), pinned, cooling)
-            }
-            Row::Ambient { provider } if !panel.not_connected(*provider) => {
-                (*provider, None, false, None)
-            }
-            _ => continue,
-        };
-        let plugin = &panel.providers[provider].plugin;
-        let (mut email, mut lines) = panel.usage_lines(plugin, label.as_deref());
-        if lines.is_empty() && pinned {
-            (email, lines) = panel.usage_lines(plugin, None);
-        }
-        lines.retain(|l| l != "\u{2026}");
-        if lines.is_empty() {
-            continue;
-        }
-        any_pinned |= pinned;
-        let mark = if pinned { "\u{25cf} " } else { "" };
-        let product = display_name(&panel.providers[provider]);
-        let mut head = match &label {
-            Some(l) => format!("{mark}{product} \u{b7} {l}"),
-            None => format!("{mark}{product}"),
-        };
-        if let Some(e) = email {
-            head.push_str(&format!("  {e}"));
-        }
-        if let Some(until) = cooling {
-            let left = until.saturating_sub(now_secs());
-            head.push_str(&format!("   cooling {}m{:02}s", left / 60, left % 60));
-        }
-        let id = format!("{plugin}/{}", label.as_deref().unwrap_or(""));
-        items.push(json!({ "id": id, "label": head }));
-        for (i, l) in lines.into_iter().enumerate() {
-            items.push(json!({ "id": format!("{id}#{i}"), "label": format!("  {l}") }));
-        }
-    }
-    if items.is_empty() {
-        return json!({ "text": "no logins report usage yet. /accounts adds an account" });
-    }
-    let footer = if any_pinned {
-        "\u{25cf} pinned account \u{b7} /accounts manages logins"
-    } else {
-        "/accounts manages logins"
-    };
-    json!({
-        "picker": {
-            "title": "Usage",
-            "items": items,
-            "footer": footer,
-        },
-    })
-}
-
 pub fn handoff_text() -> String {
     render_text(false)
 }
@@ -1685,7 +1591,7 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                     Some(l) => format!("{plugin} · {l}"),
                     None => plugin.clone(),
                 },
-                _ => "Accounts".to_string(),
+                _ => "Connect".to_string(),
             };
             let shown_providers = panel
                 .rows
