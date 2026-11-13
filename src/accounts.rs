@@ -1,4 +1,4 @@
-//! `/connect` (alias `/accounts`) — provider account pools panel.
+//! `/accounts` — provider account pools panel.
 //!
 //! Moved out of gray core (`repl/accounts_panel.rs`) and then out of
 //! gray-account: this plugin owns the whole surface. Two credential-
@@ -247,7 +247,6 @@ struct Provider {
     provider: String,
     argv: Option<Vec<String>>,
     doc: Option<Value>,
-    probe_err: Option<String>,
 }
 
 fn lock_plugins(home: &Path) -> Vec<(String, Option<Vec<String>>)> {
@@ -429,12 +428,31 @@ fn fetch_usage(argv: &[String]) -> Result<Vec<UsageEntry>, String> {
 }
 
 fn order_key(p: &Provider) -> (u8, String) {
-    let rank = match (p.plugin.as_str(), p.provider.as_str()) {
-        ("claude-sub", _) | (_, "claude") => 0,
-        ("codex-sub", _) | (_, "codex") => 1,
+    let name = display_name(p);
+    let rank = match name.as_str() {
+        "Claude" => 0,
+        "Codex" => 1,
         _ => 2,
     };
-    (rank, p.plugin.clone())
+    (rank, name)
+}
+
+/// The product a provider sells, not its plugin id: `claude-sub` → Claude.
+fn display_name(p: &Provider) -> String {
+    let id = p.provider.trim_end_matches("-subscription");
+    let id = id.trim_end_matches("-sub").trim_end_matches("-zen");
+    match id {
+        "chatgpt" => "ChatGPT".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        "lmstudio" => "LM Studio".to_string(),
+        "deepseek" => "DeepSeek".to_string(),
+        _ => {
+            let mut c = id.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect())
+                .unwrap_or_default()
+        }
+    }
 }
 
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
@@ -471,6 +489,9 @@ fn iso_epoch(s: &str) -> Option<i64> {
 
 fn countdown(resets_at: &str, now: i64) -> Option<String> {
     let left = iso_epoch(resets_at)? - now;
+    if left <= 0 {
+        return None;
+    }
     Some(if left >= 86_400 {
         format!("{}d", left / 86_400)
     } else if left >= 3_600 {
@@ -480,30 +501,47 @@ fn countdown(resets_at: &str, now: i64) -> Option<String> {
     })
 }
 
-fn bar(pct: f64) -> String {
-    let filled = (pct.clamp(0.0, 100.0) * 5.0 / 100.0).ceil() as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(5 - filled))
+struct Gauge {
+    label: String,
+    pct: f64,
+    reset: Option<String>,
 }
 
-fn window_cell(w: &Value, now: i64) -> Option<String> {
-    let label = w["label"].as_str().or_else(|| w["id"].as_str())?;
-    let pct = w["used_percent"].as_f64()?;
-    let reset = w["resets_at"]
-        .as_str()
-        .and_then(|at| countdown(at, now))
-        .map(|c| format!(" ↻{c}"))
+fn gauge(w: &Value, now: i64) -> Option<Gauge> {
+    Some(Gauge {
+        label: w["label"]
+            .as_str()
+            .or_else(|| w["id"].as_str())?
+            .to_string(),
+        pct: w["used_percent"].as_f64()?,
+        reset: w["resets_at"]
+            .as_str()
+            .and_then(|at| countdown(at, now))
+            .map(|c| format!("resets in {c}")),
+    })
+}
+
+const CELLS: usize = 16;
+
+fn cells(pct: f64) -> (usize, usize) {
+    let filled = ((pct.clamp(0.0, 100.0) * CELLS as f64 / 100.0).round() as usize).min(CELLS);
+    (filled, CELLS - filled)
+}
+
+fn gauge_text(g: &Gauge, label_w: usize) -> String {
+    let (filled, empty) = cells(g.pct);
+    let reset = g
+        .reset
+        .as_ref()
+        .map(|r| format!("   {r}"))
         .unwrap_or_default();
-    Some(format!("{label} {} {pct:.0}%{reset}", bar(pct)))
-}
-
-fn window_detail(w: &Value, now: i64) -> Option<String> {
-    let label = w["label"].as_str().or_else(|| w["id"].as_str())?;
-    let pct = w["used_percent"].as_f64()?;
-    let reset = match w["resets_at"].as_str().and_then(|at| countdown(at, now)) {
-        Some(c) => format!("resets in {c}"),
-        None => "reset time unknown".to_string(),
-    };
-    Some(format!("{label:<5} {}  {pct:>3.0}%   {reset}", bar(pct)))
+    format!(
+        "{:<label_w$}  {}{}  {:>3.0}%{reset}",
+        g.label,
+        "\u{2501}".repeat(filled),
+        "\u{2502}".repeat(empty),
+        g.pct
+    )
 }
 
 enum Row {
@@ -512,7 +550,6 @@ enum Row {
     Ambient { provider: usize },
     AddHint { provider: usize },
     Vault { auth_ref: String, label: String },
-    Plain { provider: usize },
 }
 
 struct Panel {
@@ -554,19 +591,12 @@ impl Panel {
             let Some(provider) = manifest_provider(&home, &name) else {
                 continue;
             };
-            let (doc, probe_err) = match &argv {
-                Some(argv) => match probe_accounts(argv) {
-                    Ok(v) => (Some(v), None),
-                    Err(e) => (None, Some(e)),
-                },
-                None => (None, None),
-            };
+            let doc = argv.as_ref().and_then(|argv| probe_accounts(argv).ok());
             providers.push(Provider {
                 plugin: name,
                 provider,
                 argv,
                 doc,
-                probe_err,
             });
         }
         // Vault pools for providers without an answering plugin CLI get
@@ -574,10 +604,10 @@ impl Panel {
         let served: std::collections::BTreeSet<String> = providers
             .iter()
             .filter(|p| p.doc.is_some())
-            .map(|p| p.plugin.clone())
+            .flat_map(|p| [p.plugin.clone(), p.provider.clone()])
             .collect();
         for (auth_ref, lock, provider_id) in vault_refs(&auth) {
-            if served.contains(&lock) {
+            if served.contains(&lock) || served.contains(&provider_id) {
                 continue;
             }
             providers.push(Provider {
@@ -585,7 +615,6 @@ impl Panel {
                 provider: provider_id,
                 argv: None,
                 doc: Some(json!({"_vault": auth_ref})),
-                probe_err: None,
             });
         }
         providers.sort_by_key(order_key);
@@ -600,8 +629,16 @@ impl Panel {
         let auth = auth_path().unwrap_or_default();
         self.rows.clear();
         for (i, p) in self.providers.iter().enumerate() {
+            let Some(doc) = &p.doc else {
+                continue;
+            };
+            let has_accounts = doc["accounts"].as_array().is_some_and(|l| !l.is_empty())
+                || doc.get("_vault").is_some();
+            if !has_accounts && self.not_connected(i) {
+                continue;
+            }
             self.rows.push(Row::Header { provider: i });
-            if let Some(doc) = &p.doc {
+            {
                 if let Some(auth_ref) = doc.get("_vault").and_then(Value::as_str) {
                     for r in vault_rows(&auth, auth_ref) {
                         self.rows.push(Row::Vault {
@@ -627,10 +664,9 @@ impl Panel {
                         self.rows.push(Row::AddHint { provider: i });
                     }
                 }
-            } else {
-                self.rows.push(Row::Plain { provider: i });
             }
         }
+        self.sel = self.sel.min(self.rows.len().saturating_sub(1));
     }
 
     fn start_usage(&mut self) {
@@ -698,6 +734,7 @@ impl Panel {
             };
             self.usage.insert(key, state);
         }
+        self.rebuild_rows();
     }
 
     fn pump_usage(&mut self) {
@@ -724,28 +761,77 @@ impl Panel {
         self.start_usage();
     }
 
-    fn usage_cell(&self, plugin: &str, label: Option<&str>) -> String {
+    /// The login's email from its usage card, and one line per quota window.
+    fn usage_lines(&self, plugin: &str, label: Option<&str>) -> (Option<String>, Vec<String>) {
         let key = (plugin.to_string(), label.map(str::to_string));
-        let cells = match self.usage.get(&key) {
-            Some(Fetch::Pending) => return "  …".to_string(),
+        match self.usage.get(&key) {
+            Some(Fetch::Pending) => (None, vec!["\u{2026}".to_string()]),
             Some(Fetch::Loaded(card)) => {
                 let now = now_secs() as i64;
-                card["windows"]
+                let gauges: Vec<Gauge> = card["windows"]
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .take(2)
-                    .filter_map(|w| window_cell(w, now))
-                    .collect::<Vec<_>>()
-                    .join("  ")
+                    .filter_map(|w| gauge(w, now))
+                    .collect();
+                let w = gauges
+                    .iter()
+                    .map(|g| g.label.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                let lines = gauges.iter().map(|g| gauge_text(g, w)).collect();
+                (card["email"].as_str().map(str::to_string), lines)
             }
-            _ => String::new(),
-        };
-        if cells.is_empty() {
-            cells
-        } else {
-            format!("  {cells}")
+            _ => (None, Vec::new()),
         }
+    }
+
+    fn gauges(&self, row: &Row) -> Option<Vec<Gauge>> {
+        let key = match row {
+            Row::Account { provider, label } => (
+                self.providers[*provider].plugin.clone(),
+                Some(label.clone()),
+            ),
+            Row::Ambient { provider } if !self.not_connected(*provider) => {
+                (self.providers[*provider].plugin.clone(), None)
+            }
+            _ => return None,
+        };
+        match self.usage.get(&key) {
+            Some(Fetch::Pending) => Some(Vec::new()),
+            Some(Fetch::Loaded(card)) => {
+                let now = now_secs() as i64;
+                Some(
+                    card["windows"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|w| gauge(w, now))
+                        .collect(),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    fn pending(&self, row: &Row) -> bool {
+        let key = match row {
+            Row::Account { provider, label } => (
+                self.providers[*provider].plugin.clone(),
+                Some(label.clone()),
+            ),
+            Row::Ambient { provider } => (self.providers[*provider].plugin.clone(), None),
+            _ => return false,
+        };
+        matches!(self.usage.get(&key), Some(Fetch::Pending))
+    }
+
+    fn pooled(&self, provider: usize) -> bool {
+        self.providers[provider]
+            .doc
+            .as_ref()
+            .and_then(|d| d["accounts"].as_array())
+            .is_some_and(|l| l.len() > 1)
     }
 
     /// The provider answered `account usage` for its ambient login with an
@@ -771,6 +857,20 @@ impl Panel {
     }
 
     fn open_detail(&mut self) {
+        if let Some(Row::AddHint { provider }) = self.selected_row() {
+            let provider = *provider;
+            if self.providers[provider].argv.is_some() {
+                self.mode = Mode::Adding {
+                    provider,
+                    buf: String::new(),
+                };
+                self.status = None;
+            } else {
+                self.status =
+                    Some("no account CLI for this provider \u{2014} add via /connect".into());
+            }
+            return;
+        }
         let next = match self.selected_row() {
             Some(Row::Account { provider, label }) => Some((*provider, Some(label.clone()))),
             Some(Row::Ambient { provider }) => Some((*provider, None)),
@@ -784,24 +884,28 @@ impl Panel {
         }
     }
 
-    fn detail_lines(&self, plugin: &str, label: Option<&str>) -> Vec<String> {
-        let now = now_secs() as i64;
-        let Some(p) = self.providers.iter().find(|p| p.plugin == plugin) else {
-            return Vec::new();
-        };
-        let who = label.unwrap_or("ambient login");
-        let mut out = vec![format!("{who}   {}  ({})", p.plugin, p.provider)];
+    fn index_of(&self, plugin: &str, label: Option<&str>) -> Option<usize> {
+        self.rows.iter().position(|row| match row {
+            Row::Account { provider, label: l } => {
+                self.providers[*provider].plugin == plugin && Some(l.as_str()) == label
+            }
+            Row::Ambient { provider } => {
+                self.providers[*provider].plugin == plugin && label.is_none()
+            }
+            _ => false,
+        })
+    }
+
+    fn detail_extras(&self, plugin: &str, label: Option<&str>) -> Vec<String> {
+        let mut out = Vec::new();
         let key = (plugin.to_string(), label.map(str::to_string));
         match self.usage.get(&key) {
-            Some(Fetch::Pending) | None => out.push("loading usage…".to_string()),
+            Some(Fetch::Pending) | None => out.push("loading usage\u{2026}".to_string()),
             Some(Fetch::Unsupported) => out.push("no usage from this plugin".to_string()),
-            Some(Fetch::Failed(e)) => out.push(format!("error: {e}")),
+            Some(Fetch::Failed(e)) => out.push(format!("\u{2717} {e}")),
             Some(Fetch::Loaded(card)) => {
                 if let Some(plan) = card["plan"].as_str() {
                     out.push(format!("plan {plan}"));
-                }
-                for w in card["windows"].as_array().into_iter().flatten() {
-                    out.extend(window_detail(w, now));
                 }
                 if let Some(note) = card["note"].as_str() {
                     out.push(note.to_string());
@@ -850,12 +954,14 @@ impl Panel {
                         }
                     })
                     .unwrap_or_default();
-                let mut line = format!("{}  ({})", p.plugin, p.provider);
-                if !strategy.is_empty() {
-                    line.push_str(&format!("   strategy {strategy}"));
-                }
-                if let Some(e) = &p.probe_err {
-                    line.push_str(&format!("   — {e}"));
+                let pooled = p
+                    .doc
+                    .as_ref()
+                    .and_then(|d| d["accounts"].as_array())
+                    .is_some_and(|l| l.len() > 1);
+                let mut line = display_name(p);
+                if pooled && !strategy.is_empty() {
+                    line.push_str(&format!("  \u{b7} {}", strategy.replace('_', " ")));
                 }
                 (line, true)
             }
@@ -880,8 +986,12 @@ impl Panel {
                     .as_str()
                     .map(|o| format!(" · {o}"))
                     .unwrap_or_default();
-                let usage = self.usage_cell(&p.plugin, Some(label.as_str()));
-                let mut line = format!("  {pin} {label:<12} {who}{org}{usage}");
+                let (_, usage) = self.usage_lines(&p.plugin, Some(label.as_str()));
+                let mut line = if label.is_empty() {
+                    format!("  {who}{org}")
+                } else {
+                    format!(" {pin} {label:<14} {who}{org}")
+                };
                 if a["cooling"].as_bool() == Some(true) {
                     let left = a["cooldown_until"]
                         .as_u64()
@@ -892,23 +1002,25 @@ impl Panel {
                 if let Some(e) = a["last_error"].as_str() {
                     line.push_str(&format!("   ({e})"));
                 }
+                for u in usage {
+                    line.push_str(&format!("\n     {u}"));
+                }
                 (line, false)
             }
             Row::Ambient { provider } => {
                 if self.not_connected(*provider) {
-                    ("    not connected — a to log in".to_string(), false)
+                    ("   not connected \u{b7} a to log in".to_string(), false)
                 } else {
                     let plugin = &self.providers[*provider].plugin;
-                    (
-                        format!(
-                            "    ambient login serves (no accounts yet){}",
-                            self.usage_cell(plugin, None)
-                        ),
-                        false,
-                    )
+                    let (email, usage) = self.usage_lines(plugin, None);
+                    let mut line = format!("   {}", email.as_deref().unwrap_or("signed in"));
+                    for u in usage {
+                        line.push_str(&format!("\n     {u}"));
+                    }
+                    (line, false)
                 }
             }
-            Row::AddHint { .. } => ("    + add account".to_string(), false),
+            Row::AddHint { .. } => ("  + add account".to_string(), false),
             Row::Vault { auth_ref, label } => {
                 let detail = vault_rows(&auth, auth_ref)
                     .into_iter()
@@ -927,14 +1039,7 @@ impl Panel {
                     None => (" ", "credential".to_string(), "?".to_string()),
                 };
                 (
-                    format!("  {pin} {label:<16} {who}   vault · {state}"),
-                    false,
-                )
-            }
-            Row::Plain { provider } => {
-                let p = &self.providers[*provider];
-                (
-                    format!("    {} — single login, no account pool", p.plugin),
+                    format!(" {pin} {label:<14} {who}   vault \u{b7} {state}"),
                     false,
                 )
             }
@@ -975,8 +1080,7 @@ impl Panel {
             Row::Header { provider }
             | Row::Account { provider, .. }
             | Row::Ambient { provider }
-            | Row::AddHint { provider }
-            | Row::Plain { provider } => Some(*provider),
+            | Row::AddHint { provider } => Some(*provider),
             Row::Vault { .. } => None,
         }
     }
@@ -1099,6 +1203,100 @@ pub fn text() -> String {
     render_text(true)
 }
 
+/// `/usage` as a host picker: one row per login that can answer for quota,
+/// usage bars on the right. Providers without a login or without account
+/// support stay out of the list; `/connect` is where those are managed.
+pub fn usage_picker() -> Value {
+    let mut panel = Panel::load();
+    panel.start_usage();
+    panel.await_usage(USAGE_TIMEOUT + Duration::from_secs(2));
+    panel.rebuild_rows();
+    let auth = auth_path().unwrap_or_default();
+    let mut items = Vec::new();
+    let mut any_pinned = false;
+    let mut current = 0usize;
+    for row in &panel.rows {
+        let (provider, label, pinned, cooling) = match row {
+            Row::Header { provider } => {
+                current = *provider;
+                continue;
+            }
+            Row::Account { provider, label } => {
+                let a = panel.providers[*provider].doc.as_ref().and_then(|d| {
+                    d["accounts"]
+                        .as_array()?
+                        .iter()
+                        .find(|x| x["label"].as_str() == Some(label))
+                        .cloned()
+                });
+                let a = a.unwrap_or_default();
+                let left = a["cooldown_until"].as_u64().unwrap_or(0);
+                (
+                    *provider,
+                    Some(label.clone()),
+                    a["pinned"].as_bool() == Some(true),
+                    (a["cooling"].as_bool() == Some(true)).then_some(left),
+                )
+            }
+            Row::Vault { auth_ref, label } => {
+                let r = vault_rows(&auth, auth_ref)
+                    .into_iter()
+                    .find(|r| r.label == *label);
+                let pinned = r.as_ref().is_some_and(|r| r.pinned);
+                let cooling = r.filter(|r| r.cooling).map(|r| r.cooldown_until);
+                (current, Some(label.clone()), pinned, cooling)
+            }
+            Row::Ambient { provider } if !panel.not_connected(*provider) => {
+                (*provider, None, false, None)
+            }
+            _ => continue,
+        };
+        let plugin = &panel.providers[provider].plugin;
+        let (mut email, mut lines) = panel.usage_lines(plugin, label.as_deref());
+        if lines.is_empty() && pinned {
+            (email, lines) = panel.usage_lines(plugin, None);
+        }
+        lines.retain(|l| l != "\u{2026}");
+        if lines.is_empty() {
+            continue;
+        }
+        any_pinned |= pinned;
+        let mark = if pinned { "\u{25cf} " } else { "" };
+        let product = display_name(&panel.providers[provider]);
+        let mut head = match &label {
+            Some(l) => format!("{mark}{product} \u{b7} {l}"),
+            None => format!("{mark}{product}"),
+        };
+        if let Some(e) = email {
+            head.push_str(&format!("  {e}"));
+        }
+        if let Some(until) = cooling {
+            let left = until.saturating_sub(now_secs());
+            head.push_str(&format!("   cooling {}m{:02}s", left / 60, left % 60));
+        }
+        let id = format!("{plugin}/{}", label.as_deref().unwrap_or(""));
+        items.push(json!({ "id": id, "label": head }));
+        for (i, l) in lines.into_iter().enumerate() {
+            items.push(json!({ "id": format!("{id}#{i}"), "label": format!("  {l}") }));
+        }
+    }
+    if items.is_empty() {
+        return json!({ "text": "no logins report usage yet. /accounts adds an account" });
+    }
+    let footer = if any_pinned {
+        "\u{25cf} pinned account \u{b7} /accounts manages logins"
+    } else {
+        "/accounts manages logins"
+    };
+    json!({
+        "picker": {
+            "title": "Usage",
+            "items": items,
+            "footer": footer,
+        },
+    })
+}
+
 pub fn handoff_text() -> String {
     render_text(false)
 }
@@ -1136,7 +1334,7 @@ enum Outcome {
     },
 }
 
-/// Interactive `/connect`: the ratatui panel. Runs standalone as
+/// Interactive `/accounts`: the ratatui panel. Runs standalone as
 /// `gray-connect accounts` (the TUI verb inside a `{"terminal":…}`
 /// handoff).
 pub fn run() -> anyhow::Result<()> {
@@ -1172,9 +1370,70 @@ pub fn run() -> anyhow::Result<()> {
                 let mut line = String::new();
                 let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line);
                 panel.refresh();
+                panel.status = Some(if status.success() {
+                    format!("added {label}")
+                } else {
+                    format!("account add exited {status}")
+                });
             }
         }
     }
+}
+
+/// Host theme colors from `GRAY_MODAL_THEME` (`role=#rrggbb,...`), with the
+/// default gray theme for anything missing.
+struct Theme {
+    raised: ratatui::style::Color,
+    faint: ratatui::style::Color,
+    dim: ratatui::style::Color,
+    muted: ratatui::style::Color,
+    body: ratatui::style::Color,
+    bright: ratatui::style::Color,
+    accent: ratatui::style::Color,
+    accent_soft: ratatui::style::Color,
+    on_selection: ratatui::style::Color,
+}
+
+fn theme() -> Theme {
+    use ratatui::style::Color::Rgb;
+    let mut t = Theme {
+        raised: Rgb(28, 28, 28),
+        faint: Rgb(70, 70, 70),
+        dim: Rgb(110, 110, 110),
+        muted: Rgb(140, 140, 140),
+        body: Rgb(225, 225, 225),
+        bright: Rgb(240, 240, 240),
+        accent: Rgb(246, 173, 126),
+        accent_soft: Rgb(254, 215, 170),
+        on_selection: Rgb(22, 22, 22),
+    };
+    for pair in std::env::var("GRAY_MODAL_THEME")
+        .unwrap_or_default()
+        .split(',')
+    {
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
+        let v = v.trim_start_matches('#');
+        let p = |i: usize| v.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok());
+        let (Some(r), Some(g), Some(b)) = (p(0), p(2), p(4)) else {
+            continue;
+        };
+        let c = Rgb(r, g, b);
+        match k {
+            "raised_bg" => t.raised = c,
+            "text_faint" => t.faint = c,
+            "text_dim" => t.dim = c,
+            "text_muted" => t.muted = c,
+            "text_body" => t.body = c,
+            "text_bright" => t.bright = c,
+            "accent" => t.accent = c,
+            "accent_soft" => t.accent_soft = c,
+            "on_selection" => t.on_selection = c,
+            _ => {}
+        }
+    }
+    t
 }
 
 fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
@@ -1183,21 +1442,27 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
     use ratatui::layout::Rect;
-    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::style::{Modifier, Style};
     use ratatui::text::{Line, Span};
-    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+    use ratatui::widgets::{Block, Clear, Paragraph};
 
-    const ACCENT: Color = Color::Rgb(246, 173, 126);
+    let th = theme();
 
     terminal::enable_raw_mode()?;
     let mut out = std::io::stdout();
-    execute!(out, terminal::EnterAlternateScreen, cursor::Hide)?;
+    execute!(
+        out,
+        terminal::EnterAlternateScreen,
+        cursor::Hide,
+        crossterm::event::EnableBracketedPaste
+    )?;
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
     let restore = |term: &mut Terminal<CrosstermBackend<std::io::Stdout>>| {
         let _ = execute!(
             term.backend_mut(),
             cursor::Show,
+            crossterm::event::DisableBracketedPaste,
             terminal::LeaveAlternateScreen
         );
         let _ = terminal::disable_raw_mode();
@@ -1209,84 +1474,302 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
             if area.width < 30 || area.height < 8 {
                 return;
             }
-            let modal_w = (area.width.saturating_sub(4))
-                .clamp(56, 110)
-                .min(area.width);
-            let detail = match &panel.mode {
-                Mode::Detail { plugin, label } => {
-                    Some(panel.detail_lines(plugin, label.as_deref()))
+            let fg = |c| Style::default().fg(c);
+            let detail_idx = match &panel.mode {
+                Mode::Detail { plugin, label } => panel.index_of(plugin, label.as_deref()),
+                _ => None,
+            };
+            struct Ln {
+                left: Vec<(String, Style)>,
+                right: Vec<(String, Style)>,
+                rule: bool,
+            }
+            let mut body: Vec<Ln> = Vec::new();
+            let mut sel_line = None;
+            let all_gauges: Vec<Option<Vec<Gauge>>> =
+                panel.rows.iter().map(|r| panel.gauges(r)).collect();
+            let label_w = all_gauges
+                .iter()
+                .flatten()
+                .flatten()
+                .map(|g| g.label.chars().count())
+                .max()
+                .unwrap_or(0);
+            let detail_for = |i: usize| match &panel.mode {
+                Mode::Detail { plugin, label } if detail_idx == Some(i) => {
+                    Some((plugin.clone(), label.clone()))
                 }
                 _ => None,
             };
-            let body_h = match &detail {
-                Some(lines) => lines.len() as u16 + 5,
-                None => panel.rows.len().max(1) as u16 + 7,
+            let listing = !matches!(panel.mode, Mode::Detail { .. });
+            let shown: Vec<usize> = match detail_idx {
+                Some(i) if !listing => vec![i],
+                _ => (0..panel.rows.len()).collect(),
             };
-            let modal_h = body_h.min(area.height.saturating_sub(2)).max(7);
-            let x = area.x + (area.width.saturating_sub(modal_w)) / 2;
-            let y = area.y + (area.height.saturating_sub(modal_h)) / 2;
-            let rect = Rect::new(x, y, modal_w, modal_h);
-            frame.render_widget(Clear, rect);
-            let block = Block::default().borders(Borders::ALL).title(" Connect ");
-            let inner = block.inner(rect);
-            frame.render_widget(block, rect);
-
-            let mut lines: Vec<Line> = Vec::new();
-            match detail {
-                Some(body) => {
-                    for text in body {
-                        lines.push(Line::from(text));
+            {
+                {
+                    if listing && panel.rows.is_empty() {
+                        body.push(Ln {
+                            left: vec![(
+                                "no provider plugins installed, /connect to add one".to_string(),
+                                fg(th.faint),
+                            )],
+                            right: Vec::new(),
+                            rule: false,
+                        });
                     }
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::styled(
-                        "esc back · q close",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-                None => {
-                    if panel.rows.is_empty() {
-                        lines.push(Line::from(Span::styled(
-                            "no provider plugins installed — /connect to add one",
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                    for (i, row) in panel.rows.iter().enumerate() {
+                    for &i in &shown {
+                        let row = &panel.rows[i];
+                        if listing && i > 0 && matches!(row, Row::Header { .. }) {
+                            body.push(Ln {
+                                left: Vec::new(),
+                                right: Vec::new(),
+                                rule: false,
+                            });
+                        }
                         let (text, header) = panel.row_text(row);
-                        let selected = i == panel.sel;
+                        let hint = matches!(row, Row::AddHint { .. })
+                            || matches!(row, Row::Ambient { provider } if panel.not_connected(*provider));
+                        let selected = listing && i == panel.sel;
                         let style = if selected {
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                            sel_line = Some(body.len());
+                            fg(th.on_selection).add_modifier(Modifier::BOLD)
                         } else if header {
-                            Style::default().add_modifier(Modifier::BOLD)
+                            fg(th.bright).add_modifier(Modifier::BOLD)
+                        } else if hint {
+                            fg(th.faint)
                         } else {
-                            Style::default()
+                            fg(th.body)
                         };
-                        let marker = if selected { "› " } else { "  " };
-                        lines.push(Line::from(Span::styled(format!("{marker}{text}"), style)));
+                        let head = text.split('\n').next().unwrap_or_default().to_string();
+                        let mut right: Vec<(String, Style)> = Vec::new();
+                        if let Row::Header { provider } = row {
+                            let p = &panel.providers[*provider];
+                            let n = p
+                                .doc
+                                .as_ref()
+                                .and_then(|d| d["accounts"].as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            if n > 1 {
+                                right.push((format!("{n} accounts"), fg(th.dim)));
+                            }
+                        }
+                        if panel.pending(row) {
+                            right.push(("\u{2026}".to_string(), fg(th.faint)));
+                        }
+                        body.push(Ln {
+                            left: vec![(head, style)],
+                            right,
+                            rule: header,
+                        });
+                        let Some(gauges) = &all_gauges[i] else {
+                            for part in text.split('\n').skip(1) {
+                                body.push(Ln {
+                                    left: vec![(part.to_string(), fg(th.body))],
+                                    right: Vec::new(),
+                                    rule: false,
+                                });
+                            }
+                            continue;
+                        };
+                        for g in gauges {
+                            let (filled, empty) = cells(g.pct);
+                            let tone = if g.pct >= 90.0 {
+                                ratatui::style::Color::Rgb(232, 112, 112)
+                            } else if g.pct >= 70.0 {
+                                th.accent
+                            } else {
+                                th.muted
+                            };
+                            let full = if selected { fg(th.on_selection) } else { fg(tone) };
+                            let rest = if selected { fg(th.on_selection) } else { fg(th.faint) };
+                            let num = if selected {
+                                fg(th.on_selection)
+                            } else {
+                                fg(if g.pct >= 70.0 { tone } else { th.body })
+                            };
+                            let reset = g
+                                .reset
+                                .as_ref()
+                                .map(|r| format!("{r:>14}"))
+                                .unwrap_or_else(|| " ".repeat(14));
+                            body.push(Ln {
+                                left: vec![(
+                                    format!("  {:<label_w$}", g.label),
+                                    if selected { fg(th.on_selection) } else { fg(th.dim) },
+                                )],
+                                rule: false,
+                                right: vec![
+                                    ("\u{2501}".repeat(filled), full),
+                                    ("\u{2500}".repeat(empty), rest),
+                                    (format!(" {:>3.0}%", g.pct), num),
+                                    (format!("  {reset}"), rest),
+                                ],
+                            });
+                        }
+                        if let Some((plugin, label)) = detail_for(i) {
+                            for extra in panel.detail_extras(&plugin, label.as_deref()) {
+                                body.push(Ln {
+                                    left: vec![(format!("  {extra}"), fg(th.dim))],
+                                    right: Vec::new(),
+                                    rule: false,
+                                });
+                            }
+                        }
                     }
-                    lines.push(Line::from(""));
-                    if let Mode::Adding { buf, .. } = &panel.mode {
-                        lines.push(Line::from(Span::styled(
-                            format!("new account — label [home]: {buf}▌"),
-                            Style::default().fg(ACCENT),
-                        )));
-                    }
-                    if let Some(msg) = &panel.status {
-                        lines.push(Line::from(Span::styled(
-                            msg.clone(),
-                            Style::default().fg(Color::Yellow),
-                        )));
-                    }
-                    lines.push(Line::from(Span::styled(
-                        "enter detail · a add · p pin · c unpin · d remove · s strategy · r refresh · q close",
-                        Style::default().fg(Color::DarkGray),
-                    )));
                 }
             }
-            frame.render_widget(Paragraph::new(lines), inner);
+            let mut notes: Vec<Line> = Vec::new();
+            if let Mode::Adding { buf, .. } = &panel.mode {
+                notes.push(Line::from(vec![
+                    Span::styled("name this account  ", fg(th.dim)),
+                    Span::styled(buf.clone(), fg(th.bright)),
+                    Span::styled("▌", fg(th.accent)),
+                    Span::styled(if buf.is_empty() { "e.g. work" } else { "" }, fg(th.faint)),
+                ]));
+            }
+            if let Some(msg) = &panel.status {
+                notes.push(Line::from(Span::styled(msg.clone(), fg(th.accent_soft))));
+            }
+            let keys: &[(&str, &str)] = match &panel.mode {
+                Mode::Detail { .. } => &[("esc", "back"), ("q", "close")],
+                Mode::Adding { .. } => &[("enter", "add"), ("esc", "cancel")],
+                Mode::ConfirmRemove { .. } => &[("d", "confirm remove"), ("esc", "cancel")],
+                Mode::Running { .. } => &[],
+                Mode::List if panel.row_provider().is_some_and(|p| panel.pooled(p)) => &[
+                    ("↑↓", "move"),
+                    ("enter", "detail"),
+                    ("a", "add"),
+                    ("p", "pin"),
+                    ("c", "unpin"),
+                    ("s", "strategy"),
+                    ("d", "remove"),
+                    ("esc", "close"),
+                ],
+                Mode::List => &[
+                    ("↑↓", "move"),
+                    ("enter", "detail"),
+                    ("a", "add"),
+                    ("d", "remove"),
+                    ("r", "refresh"),
+                    ("esc", "close"),
+                ],
+            };
+
+            let keys_w: usize = keys.iter().map(|(k, l)| k.chars().count() + l.chars().count() + 4).sum();
+            let ln_w = |l: &Ln| -> usize {
+                let lw: usize = l.left.iter().map(|(t, _)| t.chars().count()).sum();
+                let rw: usize = l.right.iter().map(|(t, _)| t.chars().count()).sum();
+                lw + if rw == 0 { 0 } else { rw + 2 }
+            };
+            let widest = body.iter().map(ln_w).max().unwrap_or(0).max(keys_w);
+            let modal_w = (widest as u16 + 4).clamp(64, 116).min(area.width.saturating_sub(2));
+            // header, gap, body, gap, notes, keys
+            let want = body.len() as u16 + notes.len() as u16 + 6;
+            let modal_h = want.min(area.height.saturating_sub(2));
+            let rect = Rect::new(
+                area.x + (area.width.saturating_sub(modal_w)) / 2,
+                area.y + (area.height.saturating_sub(modal_h)) / 3,
+                modal_w,
+                modal_h,
+            );
+            frame.render_widget(Clear, rect);
+            frame.render_widget(Block::default().style(Style::default().bg(th.raised)), rect);
+            // Rows span the full width so the selection bar does; text sits two in.
+            let inner = Rect::new(rect.x, rect.y + 1, rect.width, rect.height.saturating_sub(2));
+            let row = |y: u16| Rect::new(inner.x, y, inner.width, 1);
+            let bottom = inner.y + inner.height;
+            let title = match &panel.mode {
+                Mode::Detail { plugin, label } => match label {
+                    Some(l) => format!("{plugin} · {l}"),
+                    None => plugin.clone(),
+                },
+                _ => "Accounts".to_string(),
+            };
+            let shown_providers = panel
+                .rows
+                .iter()
+                .filter(|r| matches!(r, Row::Header { .. }))
+                .count();
+            let accounts = panel
+                .rows
+                .iter()
+                .filter(|r| matches!(r, Row::Account { .. } | Row::Vault { .. } | Row::Ambient { .. }))
+                .count();
+            let counts = match accounts {
+                0 => String::new(),
+                n => format!("{n} account{}", if n == 1 { "" } else { "s" }),
+            };
+            let _ = shown_providers;
+            let tpad = (inner.width as usize)
+                .saturating_sub(4 + title.chars().count() + counts.chars().count())
+                .max(2);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(title, fg(th.bright).add_modifier(Modifier::BOLD)),
+                    Span::raw(" ".repeat(tpad)),
+                    Span::styled(counts, fg(th.faint)),
+                ])),
+                row(inner.y),
+            );
+
+            let list_y = inner.y + 2;
+            let list_h = bottom.saturating_sub(list_y + 2 + notes.len() as u16) as usize;
+            let start = sel_line.map_or(0, |s| s.saturating_sub(list_h.saturating_sub(1)));
+            for (vi, ln) in body.into_iter().enumerate().skip(start).take(list_h) {
+                let lw: usize = ln.left.iter().map(|(t, _)| t.chars().count()).sum();
+                let rw: usize = ln.right.iter().map(|(t, _)| t.chars().count()).sum();
+                let pad = (inner.width as usize)
+                    .saturating_sub(2 + lw + rw)
+                    .max(if rw == 0 { 0 } else { 2 });
+                let mut spans: Vec<Span> = vec![Span::raw("  ")];
+                for (t, st) in ln.left {
+                    spans.push(Span::styled(t, st));
+                }
+                if ln.rule && pad >= 4 {
+                    let line = if sel_line == Some(vi) { th.on_selection } else { th.faint };
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled("\u{2500}".repeat(pad - 2), fg(line)));
+                    spans.push(Span::raw(" "));
+                } else {
+                    spans.push(Span::raw(" ".repeat(pad)));
+                }
+                for (t, st) in ln.right {
+                    spans.push(Span::styled(t, st));
+                }
+                let bar = if sel_line == Some(vi) {
+                    Style::default().bg(th.accent)
+                } else {
+                    Style::default()
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(spans)).style(bar),
+                    row(list_y + (vi - start) as u16),
+                );
+            }
+            let keys_y = bottom.saturating_sub(1);
+            for (n, mut line) in notes.into_iter().enumerate() {
+                line.spans.insert(0, Span::raw("  "));
+                let y = keys_y.saturating_sub(1 + n as u16);
+                frame.render_widget(Paragraph::new(line), row(y));
+            }
+            let mut hint = vec![Span::raw("  ")];
+            for (k, label) in keys {
+                hint.push(Span::styled(*k, fg(th.muted)));
+                hint.push(Span::styled(format!(" {label}   "), fg(th.dim)));
+            }
+            frame.render_widget(Paragraph::new(Line::from(hint)), row(keys_y));
         })?;
         panel.pump_usage();
 
         if !poll(Duration::from_millis(100))? {
+            continue;
+        }
+        let event = read()?;
+        if let (Mode::Adding { buf, .. }, Event::Paste(text)) = (&mut panel.mode, &event) {
+            buf.extend(text.chars().filter(|c| !c.is_control()));
             continue;
         }
         let Event::Key(KeyEvent {
@@ -1294,7 +1777,7 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
             kind,
             modifiers,
             ..
-        }) = read()?
+        }) = event
         else {
             continue;
         };
@@ -1327,7 +1810,7 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                             };
                         }
                     }
-                    _ => panel.status = Some("add needs a label".into()),
+                    _ => panel.status = Some("type a name first".into()),
                 }
             }
             (Mode::Adding { buf, .. }, KeyCode::Backspace) => {
