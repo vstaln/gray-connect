@@ -1,8 +1,8 @@
 //! gray-connect: a protocol-1.1 sidecar and CLI plugin for gray.
 //!
-//! `/connect` (alias `/accounts`) is the provider account-pool panel; it
+//! `/connect` is the provider account-pool panel; it
 //! moved here out of gray-account, which is registry login and plugin
-//! making. `/usage` prints the same usage cards as plain text.
+//! making.
 
 pub mod accounts;
 pub mod manifest;
@@ -67,13 +67,10 @@ fn command_run(params: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or_default();
     match name {
-        // Both hand the terminal to `gray-connect accounts`; `text` is what
-        // a host without a tty shows instead.
-        "/connect" | "/accounts" => json!({
+        "/connect" => json!({
             "terminal": ["accounts"],
             "text": accounts::handoff_text(),
         }),
-        "/usage" => json!({ "text": accounts::text() }),
         _ => json!({ "text": "" }),
     }
 }
@@ -88,7 +85,7 @@ mod tests {
         assert_eq!(m["name"], "connect");
         assert_eq!(m["protocol"], "1.1");
         assert_eq!(m["version"], env!("CARGO_PKG_VERSION"));
-        assert_eq!(m["commands"], json!(["/connect", "/accounts", "/usage"]));
+        assert_eq!(m["commands"], json!(["/connect"]));
         assert_eq!(m["tools"], json!([]));
         assert_eq!(m["hooks"], json!([]));
     }
