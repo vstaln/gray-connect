@@ -243,8 +243,8 @@ fn vault_remove(path: &Path, auth_ref: &str, label: &str) -> anyhow::Result<()> 
 struct Provider {
     /// Lock name (the `plugin:` auth_ref component).
     plugin: String,
-    /// First provider id the manifest declares, for display.
     provider: String,
+    host_login: bool,
     argv: Option<Vec<String>>,
     doc: Option<Value>,
 }
@@ -281,18 +281,29 @@ fn lock_plugins(home: &Path) -> Vec<(String, Option<Vec<String>>)> {
     out
 }
 
-/// The first provider id a plugin's cached manifest declares.
-fn manifest_provider(home: &Path, plugin: &str) -> Option<String> {
-    let text =
+fn manifest_providers(home: &Path, plugin: &str) -> Vec<(String, bool)> {
+    let Ok(text) =
         std::fs::read_to_string(home.join("plugins").join(format!("{plugin}-manifest.json")))
-            .ok()?;
-    let m: Value = serde_json::from_str(&text).ok()?;
+    else {
+        return Vec::new();
+    };
+    let Ok(m) = serde_json::from_str::<Value>(&text) else {
+        return Vec::new();
+    };
     m["providers"]
-        .as_array()?
-        .first()?
-        .get("id")?
-        .as_str()
-        .map(str::to_string)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|provider| {
+            let id = provider["id"].as_str()?.to_string();
+            let host_login = provider["auth_methods"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|method| method["kind"] == "oauth");
+            Some((id, host_login))
+        })
+        .collect()
 }
 
 /// `<cli> account list --json` with a hard timeout; `Err` for nonzero
@@ -544,11 +555,12 @@ fn gauge_text(g: &Gauge, label_w: usize) -> String {
     )
 }
 
+#[derive(PartialEq, Eq)]
 enum Row {
     Header { provider: usize },
     Account { provider: usize, label: String },
     Ambient { provider: usize },
-    AddHint { provider: usize },
+    Disconnected { provider: usize },
     Vault { auth_ref: String, label: String },
 }
 
@@ -588,34 +600,41 @@ impl Panel {
         let auth = auth_path().unwrap_or_default();
         let mut providers: Vec<Provider> = Vec::new();
         for (name, argv) in lock_plugins(&home) {
-            let Some(provider) = manifest_provider(&home, &name) else {
-                continue;
-            };
-            let doc = argv.as_ref().and_then(|argv| probe_accounts(argv).ok());
-            providers.push(Provider {
-                plugin: name,
-                provider,
-                argv,
-                doc,
-            });
+            for (provider, host_login) in manifest_providers(&home, &name) {
+                let argv = if host_login { None } else { argv.clone() };
+                let doc = argv.as_ref().and_then(|argv| probe_accounts(argv).ok());
+                providers.push(Provider {
+                    plugin: name.clone(),
+                    provider,
+                    host_login,
+                    argv,
+                    doc,
+                });
+            }
         }
-        // Vault pools for providers without an answering plugin CLI get
-        // their own group: the pool lives in auth.json.
-        let served: std::collections::BTreeSet<String> = providers
-            .iter()
-            .filter(|p| p.doc.is_some())
-            .flat_map(|p| [p.plugin.clone(), p.provider.clone()])
-            .collect();
         for (auth_ref, lock, provider_id) in vault_refs(&auth) {
-            if served.contains(&lock) || served.contains(&provider_id) {
+            if providers
+                .iter()
+                .any(|p| p.plugin == lock && p.provider == provider_id && p.doc.is_some())
+            {
                 continue;
             }
-            providers.push(Provider {
-                plugin: lock,
-                provider: provider_id,
-                argv: None,
-                doc: Some(json!({"_vault": auth_ref})),
-            });
+            let doc = Some(json!({"_vault": auth_ref}));
+            if let Some(installed) = providers
+                .iter_mut()
+                .find(|p| p.plugin == lock && p.provider == provider_id && p.doc.is_none())
+            {
+                installed.doc = doc;
+                installed.argv = None;
+            } else {
+                providers.push(Provider {
+                    plugin: lock,
+                    provider: provider_id,
+                    host_login: false,
+                    argv: None,
+                    doc,
+                });
+            }
         }
         providers.sort_by_key(order_key);
         self.providers = providers;
@@ -627,52 +646,78 @@ impl Panel {
 
     fn rebuild_rows(&mut self) {
         let auth = auth_path().unwrap_or_default();
-        self.rows.clear();
+        let mut connected = Vec::new();
+        let mut disconnected = Vec::new();
         for (i, p) in self.providers.iter().enumerate() {
             let Some(doc) = &p.doc else {
+                if p.host_login {
+                    disconnected.push(Row::Disconnected { provider: i });
+                }
                 continue;
             };
-            let has_accounts = doc["accounts"].as_array().is_some_and(|l| !l.is_empty())
-                || doc.get("_vault").is_some();
-            if !has_accounts && self.not_connected(i) && doc["ambient"] != true {
-                continue;
+            let mut accounts = if let Some(auth_ref) = doc.get("_vault").and_then(Value::as_str) {
+                vault_rows(&auth, auth_ref)
+                    .into_iter()
+                    .map(|r| Row::Vault {
+                        auth_ref: auth_ref.to_string(),
+                        label: r.label,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                doc["accounts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| a["label"].as_str())
+                    .map(|label| Row::Account {
+                        provider: i,
+                        label: label.to_string(),
+                    })
+                    .collect()
+            };
+            if accounts.is_empty() && self.has_ambient_login(i) {
+                accounts.push(Row::Ambient { provider: i });
             }
-            self.rows.push(Row::Header { provider: i });
-            {
-                if let Some(auth_ref) = doc.get("_vault").and_then(Value::as_str) {
-                    for r in vault_rows(&auth, auth_ref) {
-                        self.rows.push(Row::Vault {
-                            auth_ref: auth_ref.to_string(),
-                            label: r.label.clone(),
-                        });
-                    }
-                } else {
-                    match doc["accounts"].as_array() {
-                        Some(list) if !list.is_empty() => {
-                            for a in list {
-                                if let Some(label) = a["label"].as_str() {
-                                    self.rows.push(Row::Account {
-                                        provider: i,
-                                        label: label.to_string(),
-                                    });
-                                }
-                            }
-                        }
-                        _ => self.rows.push(Row::Ambient { provider: i }),
-                    }
-                    if p.argv.is_some() {
-                        self.rows.push(Row::AddHint { provider: i });
-                    }
+            if accounts.is_empty() {
+                if p.host_login || p.argv.is_some() {
+                    disconnected.push(Row::Disconnected { provider: i });
                 }
+            } else {
+                connected.push(Row::Header { provider: i });
+                connected.extend(accounts);
             }
         }
-        self.sel = self.sel.min(self.rows.len().saturating_sub(1));
+        let mut represented = connected
+            .iter()
+            .filter_map(|row| match row {
+                Row::Header { provider } if self.providers[*provider].host_login => {
+                    Some(self.providers[*provider].provider.as_str())
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        connected.extend(disconnected.into_iter().filter(|row| {
+            let Row::Disconnected { provider } = row else {
+                return true;
+            };
+            let p = &self.providers[*provider];
+            !p.host_login || represented.insert(p.provider.as_str())
+        }));
+        self.sel = self
+            .rows
+            .get(self.sel)
+            .and_then(|selected| connected.iter().position(|row| row == selected))
+            .unwrap_or_else(|| self.sel.min(connected.len().saturating_sub(1)));
+        self.rows = connected;
     }
 
     fn start_usage(&mut self) {
         self.usage_gen += 1;
         self.usage.clear();
         for p in &self.providers {
+            if p.doc.is_none() {
+                continue;
+            }
             let Some(argv) = p.argv.clone() else {
                 continue;
             };
@@ -720,6 +765,7 @@ impl Panel {
                 for key in keys {
                     self.usage.insert(key, Fetch::Failed(e.clone()));
                 }
+                self.rebuild_rows();
                 return;
             }
         };
@@ -782,6 +828,7 @@ impl Panel {
                 let lines = gauges.iter().map(|g| gauge_text(g, w)).collect();
                 (card["email"].as_str().map(str::to_string), lines)
             }
+            Some(Fetch::Failed(_)) => (None, vec!["Usage unavailable".to_string()]),
             _ => (None, Vec::new()),
         }
     }
@@ -792,9 +839,7 @@ impl Panel {
                 self.providers[*provider].plugin.clone(),
                 Some(label.clone()),
             ),
-            Row::Ambient { provider } if !self.not_connected(*provider) => {
-                (self.providers[*provider].plugin.clone(), None)
-            }
+            Row::Ambient { provider } => (self.providers[*provider].plugin.clone(), None),
             _ => return None,
         };
         match self.usage.get(&key) {
@@ -834,11 +879,42 @@ impl Panel {
             .is_some_and(|l| l.len() > 1)
     }
 
-    /// The provider answered `account usage` for its ambient login with an
-    /// error — no login, no quota.
-    fn not_connected(&self, provider: usize) -> bool {
-        let key = (self.providers[provider].plugin.clone(), None);
-        matches!(self.usage.get(&key), Some(Fetch::Failed(_)))
+    fn has_ambient_login(&self, provider: usize) -> bool {
+        let p = &self.providers[provider];
+        if p.argv.is_none() {
+            return false;
+        }
+        match self.usage.get(&(p.plugin.clone(), None)) {
+            Some(Fetch::Loaded(_)) => true,
+            Some(Fetch::Failed(error)) => {
+                let error = error.to_ascii_lowercase();
+                p.doc.as_ref().is_some_and(|d| d["ambient"] == true)
+                    && ![
+                        "not signed in",
+                        "not logged in",
+                        "no login",
+                        "no credentials",
+                    ]
+                    .iter()
+                    .any(|phrase| error.contains(phrase))
+            }
+            _ => p.doc.as_ref().is_some_and(|d| d["ambient"] == true),
+        }
+    }
+
+    fn section_title(&self, index: usize) -> Option<&'static str> {
+        let disconnected = matches!(self.rows[index], Row::Disconnected { .. });
+        if index == 0 {
+            Some(if disconnected {
+                "Not connected"
+            } else {
+                "Connected"
+            })
+        } else if disconnected && !matches!(self.rows[index - 1], Row::Disconnected { .. }) {
+            Some("Not connected")
+        } else {
+            None
+        }
     }
 
     /// What a `p`/`c`/`d` applies to right now.
@@ -857,18 +933,8 @@ impl Panel {
     }
 
     fn open_detail(&mut self) {
-        if let Some(Row::AddHint { provider }) = self.selected_row() {
-            let provider = *provider;
-            if self.providers[provider].argv.is_some() {
-                self.mode = Mode::Adding {
-                    provider,
-                    buf: String::new(),
-                };
-                self.status = None;
-            } else {
-                self.status =
-                    Some("no account CLI for this provider \u{2014} add via /connect".into());
-            }
+        if let Some(Row::Disconnected { provider }) = self.selected_row() {
+            self.open_add(*provider);
             return;
         }
         let next = match self.selected_row() {
@@ -881,6 +947,19 @@ impl Panel {
                 plugin: self.providers[provider].plugin.clone(),
                 label,
             };
+        }
+    }
+
+    fn open_add(&mut self, provider: usize) {
+        let p = &self.providers[provider];
+        if p.host_login {
+            self.status = Some(format!("Sign in to {} from /models.", display_name(p)));
+        } else if p.argv.is_some() {
+            self.mode = Mode::Adding {
+                provider,
+                buf: String::new(),
+            };
+            self.status = None;
         }
     }
 
@@ -984,61 +1063,34 @@ impl Panel {
                 (line, false)
             }
             Row::Ambient { provider } => {
-                if self.not_connected(*provider) {
-                    let key = (self.providers[*provider].plugin.clone(), None);
-                    let auth = match self.usage.get(&key) {
-                        Some(Fetch::Failed(e)) => {
-                            let e = e.to_lowercase();
-                            ["401", "403", "unauthorized", "expired", "login", "auth"]
-                                .iter()
-                                .any(|w| e.contains(w))
-                        }
-                        _ => false,
-                    };
-                    let ambient = self.providers[*provider]
-                        .doc
-                        .as_ref()
-                        .is_some_and(|d| d["ambient"] == true);
-                    let msg = if ambient && auth {
-                        "   login expired \u{b7} a to log in again"
-                    } else if ambient {
-                        "   usage unavailable \u{b7} r to retry"
-                    } else {
-                        "   not connected \u{b7} a to log in"
-                    };
-                    (msg.to_string(), false)
-                } else {
-                    let plugin = &self.providers[*provider].plugin;
-                    let (email, usage) = self.usage_lines(plugin, None);
-                    let mut line = format!("   {}", email.as_deref().unwrap_or("signed in"));
-                    for u in usage {
-                        line.push_str(&format!("\n     {u}"));
-                    }
-                    (line, false)
+                let plugin = &self.providers[*provider].plugin;
+                let (email, usage) = self.usage_lines(plugin, None);
+                let mut line = format!("   {}", email.as_deref().unwrap_or("Signed in"));
+                for u in usage {
+                    line.push_str(&format!("\n     {u}"));
                 }
+                (line, false)
             }
-            Row::AddHint { .. } => ("  + add account".to_string(), false),
+            Row::Disconnected { provider } => (display_name(&self.providers[*provider]), false),
             Row::Vault { auth_ref, label } => {
                 let detail = vault_rows(&auth, auth_ref)
                     .into_iter()
                     .find(|r| r.label == *label);
-                let (pin, who, state) = match &detail {
-                    Some(r) => (
-                        if r.pinned { "●" } else { " " },
-                        r.email.clone().unwrap_or_else(|| "credential".into()),
-                        if r.cooling {
-                            let left = r.cooldown_until.saturating_sub(now_secs());
-                            format!("cooling {}m{:02}s", left / 60, left % 60)
-                        } else {
-                            "ok".to_string()
-                        },
-                    ),
-                    None => (" ", "credential".to_string(), "?".to_string()),
+                let pin = if detail.as_ref().is_some_and(|r| r.pinned) {
+                    "●"
+                } else {
+                    " "
                 };
-                (
-                    format!(" {pin} {label:<14} {who}   vault \u{b7} {state}"),
-                    false,
-                )
+                let who = detail.as_ref().and_then(|r| r.email.as_deref());
+                let mut line = match who {
+                    Some(email) => format!(" {pin} {label:<14} {email}"),
+                    None => format!(" {pin} {label}"),
+                };
+                if let Some(r) = detail.filter(|r| r.cooling) {
+                    let left = r.cooldown_until.saturating_sub(now_secs());
+                    line.push_str(&format!("   cooling {}m{:02}s", left / 60, left % 60));
+                }
+                (line, false)
             }
         }
     }
@@ -1077,7 +1129,7 @@ impl Panel {
             Row::Header { provider }
             | Row::Account { provider, .. }
             | Row::Ambient { provider }
-            | Row::AddHint { provider } => Some(*provider),
+            | Row::Disconnected { provider } => Some(*provider),
             Row::Vault { .. } => None,
         }
     }
@@ -1094,7 +1146,7 @@ impl Panel {
                 Row::Header { provider }
                 | Row::Account { provider, .. }
                 | Row::Ambient { provider }
-                | Row::AddHint { provider },
+                | Row::Disconnected { provider },
             ) => *provider,
             _ => return,
         };
@@ -1215,11 +1267,15 @@ fn render_text(with_usage: bool) -> String {
         return "no provider plugins installed — /connect to add one".to_string();
     }
     let mut out = String::new();
-    for row in &panel.rows {
-        let (text, header) = panel.row_text(row);
-        if header && !out.is_empty() {
+    for (i, row) in panel.rows.iter().enumerate() {
+        if let Some(title) = panel.section_title(i) {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(title);
             out.push('\n');
         }
+        let (text, _) = panel.row_text(row);
         out.push_str(&text);
         out.push('\n');
     }
@@ -1423,16 +1479,30 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                     }
                     for &i in &shown {
                         let row = &panel.rows[i];
-                        if listing && i > 0 && matches!(row, Row::Header { .. }) {
+                        let section = if listing {
+                            panel.section_title(i)
+                        } else {
+                            None
+                        };
+                        if listing
+                            && i > 0
+                            && (section.is_some() || matches!(row, Row::Header { .. }))
+                        {
                             body.push(Ln {
                                 left: Vec::new(),
                                 right: Vec::new(),
                                 rule: false,
                             });
                         }
+                        if let Some(title) = section {
+                            body.push(Ln {
+                                left: vec![(title.to_string(), fg(th.muted))],
+                                right: Vec::new(),
+                                rule: true,
+                            });
+                        }
                         let (text, header) = panel.row_text(row);
-                        let hint = matches!(row, Row::AddHint { .. })
-                            || matches!(row, Row::Ambient { provider } if panel.not_connected(*provider));
+                        let hint = matches!(row, Row::Disconnected { .. });
                         let selected = listing && i == panel.sel;
                         let style = if selected {
                             sel_line = Some(body.len());
@@ -1446,25 +1516,13 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                         };
                         let head = text.split('\n').next().unwrap_or_default().to_string();
                         let mut right: Vec<(String, Style)> = Vec::new();
-                        if let Row::Header { provider } = row {
-                            let p = &panel.providers[*provider];
-                            let n = p
-                                .doc
-                                .as_ref()
-                                .and_then(|d| d["accounts"].as_array())
-                                .map(|a| a.len())
-                                .unwrap_or(0);
-                            if n > 1 {
-                                right.push((format!("{n} accounts"), fg(th.dim)));
-                            }
-                        }
                         if panel.pending(row) {
                             right.push(("\u{2026}".to_string(), fg(th.faint)));
                         }
                         body.push(Ln {
                             left: vec![(head, style)],
                             right,
-                            rule: header,
+                            rule: false,
                         });
                         let Some(gauges) = &all_gauges[i] else {
                             for part in text.split('\n').skip(1) {
@@ -1485,30 +1543,32 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                             } else {
                                 th.muted
                             };
-                            let full = if selected { fg(th.on_selection) } else { fg(tone) };
-                            let rest = if selected { fg(th.on_selection) } else { fg(th.faint) };
-                            let num = if selected {
-                                fg(th.on_selection)
-                            } else {
-                                fg(if g.pct >= 70.0 { tone } else { th.body })
-                            };
+                            let full = fg(tone);
+                            let rest = fg(th.faint);
+                            let num = fg(if g.pct >= 70.0 { tone } else { th.body });
                             let reset = g
                                 .reset
                                 .as_ref()
                                 .map(|r| format!("{r:>15}"))
                                 .unwrap_or_else(|| " ".repeat(15));
                             body.push(Ln {
-                                left: vec![(
-                                    format!("  {:<label_w$}", g.label),
-                                    if selected { fg(th.on_selection) } else { fg(th.dim) },
-                                )],
+                                left: vec![(format!("  {:<label_w$}", g.label), fg(th.dim))],
                                 rule: false,
-                                right: vec![
-                                    ("\u{2501}".repeat(filled), full),
-                                    ("\u{2500}".repeat(empty), rest),
-                                    (format!(" {:>3.0}%", g.pct), num),
-                                    (format!("  {reset}"), rest),
-                                ],
+                                right: if area.width < 64 {
+                                    let reset =
+                                        reset.trim().trim_start_matches("resets in ").trim();
+                                    vec![
+                                        (format!("{:>3.0}%", g.pct), num),
+                                        (format!("  {reset:>5}"), rest),
+                                    ]
+                                } else {
+                                    vec![
+                                        ("\u{2501}".repeat(filled), full),
+                                        ("\u{2500}".repeat(empty), rest),
+                                        (format!(" {:>3.0}%", g.pct), num),
+                                        (format!("  {reset}"), rest),
+                                    ]
+                                },
                             });
                         }
                         if let Some((plugin, label)) = detail_for(i) {
@@ -1540,6 +1600,9 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                 Mode::Adding { .. } => &[("enter", "add"), ("esc", "cancel")],
                 Mode::ConfirmRemove { .. } => &[("d", "confirm remove"), ("esc", "cancel")],
                 Mode::Running { .. } => &[],
+                Mode::List if matches!(panel.selected_row(), Some(Row::Disconnected { .. })) => {
+                    &[("↑↓", "move"), ("enter", "sign in"), ("esc", "close")]
+                }
                 Mode::List if panel.row_provider().is_some_and(|p| panel.pooled(p)) => &[
                     ("↑↓", "move"),
                     ("enter", "detail"),
@@ -1560,17 +1623,28 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                 ],
             };
 
-            let keys_w: usize = [("↑↓", "move"), ("enter", "detail"), ("a", "add"), ("p", "pin"), ("c", "unpin"), ("s", "strategy"), ("d", "remove"), ("esc", "close")]
-                .iter()
-                .map(|(k, l)| k.chars().count() + l.chars().count() + 4)
-                .sum();
+            let keys_w: usize = [
+                ("↑↓", "move"),
+                ("enter", "detail"),
+                ("a", "add"),
+                ("p", "pin"),
+                ("c", "unpin"),
+                ("s", "strategy"),
+                ("d", "remove"),
+                ("esc", "close"),
+            ]
+            .iter()
+            .map(|(k, l)| k.chars().count() + l.chars().count() + 4)
+            .sum();
             let ln_w = |l: &Ln| -> usize {
                 let lw: usize = l.left.iter().map(|(t, _)| t.chars().count()).sum();
                 let rw: usize = l.right.iter().map(|(t, _)| t.chars().count()).sum();
                 lw + if rw == 0 { 0 } else { rw + 2 }
             };
             let widest = body.iter().map(ln_w).max().unwrap_or(0).max(keys_w);
-            let modal_w = (widest as u16 + 4).clamp(64, 116).min(area.width.saturating_sub(2));
+            let modal_w = (widest as u16 + 4)
+                .clamp(64, 116)
+                .min(area.width.saturating_sub(2));
             // header, gap, body, gap, notes, keys
             let want = body.len() as u16 + notes.len().max(1) as u16 + 6;
             let modal_h = want.min(area.height.saturating_sub(2));
@@ -1583,7 +1657,12 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
             frame.render_widget(Clear, rect);
             frame.render_widget(Block::default().style(Style::default().bg(th.raised)), rect);
             // Rows span the full width so the selection bar does; text sits two in.
-            let inner = Rect::new(rect.x, rect.y + 1, rect.width, rect.height.saturating_sub(2));
+            let inner = Rect::new(
+                rect.x,
+                rect.y + 1,
+                rect.width,
+                rect.height.saturating_sub(2),
+            );
             let row = |y: u16| Rect::new(inner.x, y, inner.width, 1);
             let bottom = inner.y + inner.height;
             let title = match &panel.mode {
@@ -1593,51 +1672,45 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                 },
                 _ => "Connect".to_string(),
             };
-            let shown_providers = panel
-                .rows
-                .iter()
-                .filter(|r| matches!(r, Row::Header { .. }))
-                .count();
-            let accounts = panel
-                .rows
-                .iter()
-                .filter(|r| matches!(r, Row::Account { .. } | Row::Vault { .. } | Row::Ambient { .. }))
-                .count();
-            let counts = match accounts {
-                0 => String::new(),
-                n => format!("{n} account{}", if n == 1 { "" } else { "s" }),
-            };
-            let _ = shown_providers;
-            let tpad = (inner.width as usize)
-                .saturating_sub(4 + title.chars().count() + counts.chars().count())
-                .max(2);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::raw("  "),
                     Span::styled(title, fg(th.bright).add_modifier(Modifier::BOLD)),
-                    Span::raw(" ".repeat(tpad)),
-                    Span::styled(counts, fg(th.faint)),
                 ])),
                 row(inner.y),
             );
 
             let list_y = inner.y + 2;
             let list_h = bottom.saturating_sub(list_y + 2 + notes.len().max(1) as u16) as usize;
-            let start = sel_line.map_or(0, |s| s.saturating_sub(list_h.saturating_sub(1)));
+            let start = sel_line.map_or(0, |s| {
+                let group_end = body
+                    .iter()
+                    .enumerate()
+                    .skip(s + 1)
+                    .take_while(|(_, ln)| {
+                        ln.left
+                            .first()
+                            .is_some_and(|(text, _)| text.starts_with("  "))
+                    })
+                    .last()
+                    .map_or(s, |(i, _)| i);
+                group_end
+                    .min(s + list_h.saturating_sub(1))
+                    .saturating_sub(list_h.saturating_sub(1))
+            });
             for (vi, ln) in body.into_iter().enumerate().skip(start).take(list_h) {
                 let lw: usize = ln.left.iter().map(|(t, _)| t.chars().count()).sum();
                 let rw: usize = ln.right.iter().map(|(t, _)| t.chars().count()).sum();
                 let pad = (inner.width as usize)
-                    .saturating_sub(2 + lw + rw)
+                    .saturating_sub(4 + lw + rw)
                     .max(if rw == 0 { 0 } else { 2 });
                 let mut spans: Vec<Span> = vec![Span::raw("  ")];
                 for (t, st) in ln.left {
                     spans.push(Span::styled(t, st));
                 }
                 if ln.rule && pad >= 4 {
-                    let line = if sel_line == Some(vi) { th.on_selection } else { th.faint };
                     spans.push(Span::raw(" "));
-                    spans.push(Span::styled("\u{2500}".repeat(pad - 2), fg(line)));
+                    spans.push(Span::styled("\u{2500}".repeat(pad - 2), fg(th.faint)));
                     spans.push(Span::raw(" "));
                 } else {
                     spans.push(Span::raw(" ".repeat(pad)));
@@ -1650,6 +1723,9 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
                 } else {
                     Style::default()
                 };
+                if sel_line == Some(vi) {
+                    spans[0] = Span::styled("› ", fg(th.on_selection));
+                }
                 frame.render_widget(
                     Paragraph::new(Line::from(spans)).style(bar),
                     row(list_y + (vi - start) as u16),
@@ -1781,20 +1857,11 @@ fn tui_once(panel: &mut Panel) -> anyhow::Result<Outcome> {
             (Mode::List, KeyCode::Char('d')) => panel.do_remove(),
             (Mode::List, KeyCode::Char('s')) => panel.toggle_strategy(),
             (Mode::List, KeyCode::Char('r')) => panel.refresh(),
-            (Mode::List, KeyCode::Char('a')) => match panel.row_provider() {
-                Some(provider) if panel.providers[provider].argv.is_some() => {
-                    panel.mode = Mode::Adding {
-                        provider,
-                        buf: String::new(),
-                    };
-                    panel.status = None;
+            (Mode::List, KeyCode::Char('a')) => {
+                if let Some(provider) = panel.row_provider() {
+                    panel.open_add(provider);
                 }
-                Some(_) => {
-                    panel.status =
-                        Some("no account CLI for this provider — add via /connect".into());
-                }
-                None => {}
-            },
+            }
             (Mode::List, _) => {}
         }
         // The prompt asked for a tty login: hand control back to `run`.
